@@ -1,8 +1,10 @@
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
+const dns = require("dns");
 const helmet = require("helmet");
 const morgan = require("morgan");
+dns.setServers(["8.8.8.8", "1.1.1.1"]);
 const connectDB = require("./config/db");
 const hsnRoutes = require("./routes/hsnRoutes");
 const authRoutes = require("./routes/authRoutes");
@@ -52,7 +54,12 @@ const app = express();
 // Middlewares
 app.use(helmet());
 app.use(cors({
-  origin: ["http://localhost:3000", "http://localhost:3001"],
+  origin: [
+    "http://localhost:3000", 
+    "http://localhost:3001",
+    "https://arihant-frontend-seven.vercel.app",
+    process.env.FRONTEND_URL
+  ].filter(Boolean),
   credentials: true,
 }));
 app.use(express.json());
