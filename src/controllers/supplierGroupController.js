@@ -2,12 +2,33 @@ const SupplierGroup = require("../models/SupplierGroup");
 
 const getSupplierGroups = async (req, res) => {
   try {
-    const { companyId } = req.query;
+    const { companyId, page = 1, limit = 10, search = "" } = req.query;
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
-    const groups = await SupplierGroup.find({ companyId }).sort({ name: 1 });
-    res.status(200).json(groups);
+
+    const query = { companyId };
+    if (search) {
+      query.name = { $regex: search, $options: "i" };
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const parsedLimit = parseInt(limit);
+
+    const [groups, total] = await Promise.all([
+      SupplierGroup.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
+      SupplierGroup.countDocuments(query)
+    ]);
+
+    res.status(200).json({
+      data: groups,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parsedLimit,
+        totalPages: Math.ceil(total / parsedLimit)
+      }
+    });
   } catch (error) {
     res.status(500).json({ message: "Server Error", error: error.message });
   }

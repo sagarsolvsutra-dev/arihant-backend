@@ -30,4 +30,6 @@ const ItemGroupSchema = new mongoose.Schema(
 
 ItemGroupSchema.index({ companyId: 1, name: 1 }, { unique: true });
 
+ItemGroupSchema.index({ companyId: 1, createdAt: -1 });
+
 module.exports = mongoose.model("ItemGroup", ItemGroupSchema);

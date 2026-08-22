@@ -5,14 +5,37 @@ const Hsn = require("../models/Hsn");
 // @access  Public
 const getHsnCodes = async (req, res) => {
   try {
-    const { companyId } = req.query;
+    const { companyId, page = 1, limit = 10, search = "" } = req.query;
 
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
 
-    const hsnCodes = await Hsn.find({ companyId }).sort({ hsnCode: 1 });
-    res.status(200).json(hsnCodes);
+    const query = { companyId };
+    if (search) {
+      query.$or = [
+        { hsnCode: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } }
+      ];
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const parsedLimit = parseInt(limit);
+
+    const [hsnCodes, total] = await Promise.all([
+      Hsn.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
+      Hsn.countDocuments(query)
+    ]);
+
+    res.status(200).json({
+      data: hsnCodes,
+      pagination: {
+        total,
+        page: parseInt(page),
+        limit: parsedLimit,
+        totalPages: Math.ceil(total / parsedLimit)
+      }
+    });
   } catch (error) {
     res.status(500).json({ message: "Server Error", error: error.message });
   }

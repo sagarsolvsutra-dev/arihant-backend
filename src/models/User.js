@@ -51,4 +51,6 @@ const UserSchema = new mongoose.Schema(
 UserSchema.index({ companyId: 1, role: 1 });
 UserSchema.index({ email: 1, isActive: 1 });
 
+UserSchema.index({ companyId: 1, createdAt: -1 });
+
 module.exports = mongoose.model("User", UserSchema);

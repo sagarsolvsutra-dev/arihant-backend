@@ -42,7 +42,7 @@ const getCompanyById = async (req, res) => {
 // @route   GET /api/companies
 const getCompanies = async (req, res) => {
   try {
-    const companies = await Company.find().sort({ createdAt: -1 });
+    const companies = await Company.find().sort({ createdAt: -1 }).lean();
 
     const counts = await User.aggregate([
       { $match: { role: "company_admin", isActive: true } },
@@ -54,7 +54,7 @@ const getCompanies = async (req, res) => {
     });
 
     const companiesWithCount = companies.map((c) => ({
-      ...c.toObject(),
+      ...c,
       adminCount: countMap[c._id.toString()] || 0,
     }));
 

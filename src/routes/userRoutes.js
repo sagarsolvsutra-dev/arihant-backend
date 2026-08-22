@@ -1,8 +1,8 @@
 const express = require("express");
 const router = express.Router();
-const { deleteUser } = require("../controllers/userController");
+const { getUsers, deleteUser } = require("../controllers/userController");
 
-// DELETE user (soft delete)
+router.get("/", getUsers);
 router.delete("/:id", deleteUser);
 
 module.exports = router;

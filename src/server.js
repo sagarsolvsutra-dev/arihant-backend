@@ -74,9 +74,21 @@ app.use("/api/auth", authRoutes);
 app.use("/api/hsn", hsnRoutes);
 app.use("/api/companies", require("./routes/companyRoutes"));
 app.use("/api/users", require("./routes/userRoutes"));
+// Master Routes
 app.use("/api/item-groups", require("./routes/itemGroupRoutes"));
+app.use("/api/item-names", require("./routes/itemNameRoutes"));
+app.use("/api/item-sub-groups", require("./routes/itemSubGroupRoutes"));
 app.use("/api/customer-groups", require("./routes/customerGroupRoutes"));
 app.use("/api/supplier-groups", require("./routes/supplierGroupRoutes"));
+app.use("/api/hsn", require("./routes/hsnRoutes"));
+
+// Data Routes
+app.use("/api/items", require("./routes/itemRoutes"));
+app.use("/api/customers", require("./routes/customerRoutes"));
+app.use("/api/suppliers", require("./routes/supplierRoutes"));
+app.use("/api/salesmen", require("./routes/salesmanRoutes"));
+app.use("/api/schemes", require("./routes/schemeRoutes"));
+app.use("/api/opening-bills", require("./routes/openingBillRoutes"));
 
 // Health Check
 app.get("/health", (req, res) => {

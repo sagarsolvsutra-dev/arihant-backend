@@ -29,4 +29,6 @@ const HsnSchema = new mongoose.Schema(
 // Compound index to ensure uniqueness of HSN code within a company
 HsnSchema.index({ companyId: 1, hsnCode: 1 }, { unique: true });
 
+HsnSchema.index({ companyId: 1, createdAt: -1 });
+
 module.exports = mongoose.model("Hsn", HsnSchema);

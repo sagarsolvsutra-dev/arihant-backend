@@ -22,4 +22,6 @@ const CustomerGroupSchema = new mongoose.Schema(
 
 CustomerGroupSchema.index({ companyId: 1, name: 1 }, { unique: true });
 
+CustomerGroupSchema.index({ companyId: 1, createdAt: -1 });
+
 module.exports = mongoose.model("CustomerGroup", CustomerGroupSchema);

@@ -1,4 +1,5 @@
 const User = require("../models/User");
+const Company = require("../models/Company");
 
 // @desc    Delete (soft) user
 // @route   DELETE /api/users/:id
@@ -35,4 +36,28 @@ const deleteUser = async (req, res) => {
   }
 };
 
-module.exports = { deleteUser };
+// @desc    Get all users
+// @route   GET /api/users
+const getUsers = async (req, res) => {
+  try {
+    const { companyId, role } = req.query;
+
+    let query = {};
+    if (companyId) query.companyId = companyId;
+    if (role) query.role = role;
+
+    const users = await User.find(query).lean()
+      .populate("companyId", "name code")
+      .sort({ createdAt: -1 }).lean();
+
+    res.status(200).json(users);
+  } catch (error) {
+    console.error("Get users error:", error);
+    res.status(500).json({
+      success: false,
+      message: error.message || "Server error",
+    });
+  }
+};
+
+module.exports = { deleteUser, getUsers };

@@ -220,12 +220,12 @@ const getUsers = async (req, res) => {
       query.companyId = companyId;
     }
 
-    const users = await User.find(query)
+    const users = await User.find(query).lean()
       .populate("companyId", "name code")
-      .sort({ createdAt: -1 });
+      .sort({ createdAt: -1 }).lean();
 
     const decryptedUsers = users.map((user) => {
-      const userObj = user.toObject();
+      const userObj = user;
       userObj.password = decryptPassword(userObj.password);
       return userObj;
     });
