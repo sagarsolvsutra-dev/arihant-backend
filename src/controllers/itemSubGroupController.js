@@ -30,13 +30,13 @@ const getItemSubGroups = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
 const createItemSubGroup = async (req, res) => {
   try {
-    const { companyId, name, itemGroupId, itemNameId, isActive } = req.body;
+    const { companyId, name, supplierId, itemNameId, isActive } = req.body;
     if (!companyId || !name) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
@@ -49,13 +49,13 @@ const createItemSubGroup = async (req, res) => {
     const subGroup = await ItemSubGroup.create({
       companyId,
       name,
-      itemGroupId,
+      supplierId,
       itemNameId,
       isActive,
     });
     res.status(201).json(subGroup);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -68,14 +68,14 @@ const updateItemSubGroup = async (req, res) => {
 
     if (req.body.name !== undefined) subGroup.name = req.body.name;
 
-    if (req.body.itemGroupId !== undefined) subGroup.itemGroupId = req.body.itemGroupId;
+    if (req.body.supplierId !== undefined) subGroup.supplierId = req.body.supplierId;
     if (req.body.itemNameId !== undefined) subGroup.itemNameId = req.body.itemNameId;
     if (req.body.isActive !== undefined) subGroup.isActive = req.body.isActive;
 
     await subGroup.save();
     res.status(200).json(subGroup);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -88,7 +88,7 @@ const deleteItemSubGroup = async (req, res) => {
     await subGroup.deleteOne();
     res.status(200).json({ message: "Item Sub Group deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 

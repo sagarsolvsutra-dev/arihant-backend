@@ -1,4 +1,5 @@
 const CustomerGroup = require("../models/CustomerGroup");
+const { sendError } = require("../utils/errorHandler");
 
 const getCustomerGroups = async (req, res) => {
   try {
@@ -30,7 +31,7 @@ const getCustomerGroups = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -54,7 +55,7 @@ const createCustomerGroup = async (req, res) => {
 
     res.status(201).json(group);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -80,7 +81,7 @@ const updateCustomerGroup = async (req, res) => {
     await group.save();
     res.status(200).json(group);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -93,7 +94,7 @@ const deleteCustomerGroup = async (req, res) => {
     await group.deleteOne();
     res.status(200).json({ message: "Customer Group deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 

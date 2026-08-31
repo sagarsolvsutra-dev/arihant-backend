@@ -1,4 +1,5 @@
 const Hsn = require("../models/Hsn");
+const { sendError } = require("../utils/errorHandler");
 
 // @desc    Get all HSN codes for a company
 // @route   GET /api/hsn
@@ -37,7 +38,7 @@ const getHsnCodes = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -73,7 +74,7 @@ const createHsnCode = async (req, res) => {
 
     res.status(201).json(newHsn);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -104,7 +105,7 @@ const updateHsnCode = async (req, res) => {
     await hsn.save();
     res.status(200).json(hsn);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -122,7 +123,7 @@ const deleteHsnCode = async (req, res) => {
     await hsn.deleteOne();
     res.status(200).json({ message: "HSN Code deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 

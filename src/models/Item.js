@@ -12,9 +12,9 @@ const ItemSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
-    itemGroupId: {
+    supplierId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "ItemGroup",
+      ref: "Supplier",
       default: null,
     },
     itemSubGroupId: {
@@ -106,6 +106,63 @@ const ItemSchema = new mongoose.Schema(
     netCostRetailerPerPiece: { type: Number, default: 0 },
     netCostWholesalerPerPiece: { type: Number, default: 0 },
     netCostDistributorPerPiece: { type: Number, default: 0 },
+    mrpEntries: {
+      type: [
+        {
+          mrp: { type: Number, default: 0 },
+          mrpActive: { type: Boolean, default: true },
+          purchaseRate: { type: Number, default: 0 },
+          discountPercentage: { type: Number, default: 0 },
+          netCostSelf: { type: Number, default: 0 },
+          netCostSelfPerPiece: { type: Number, default: 0 },
+          marginToCostRetailer: { type: Number, default: 0 },
+          marginToCostWholesaler: { type: Number, default: 0 },
+          marginToCostDistributor: { type: Number, default: 0 },
+          marginToMrpRetailer: { type: Number, default: 0 },
+          marginToMrpWholesaler: { type: Number, default: 0 },
+          marginToMrpDistributor: { type: Number, default: 0 },
+          retailRate: { type: Number, default: 0 },
+          wholeSaleRate: { type: Number, default: 0 },
+          distributorRate: { type: Number, default: 0 },
+          netCostRetailer: { type: Number, default: 0 },
+          netCostWholesaler: { type: Number, default: 0 },
+          netCostDistributor: { type: Number, default: 0 },
+          netCostRetailerPerPiece: { type: Number, default: 0 },
+          netCostWholesalerPerPiece: { type: Number, default: 0 },
+          netCostDistributorPerPiece: { type: Number, default: 0 },
+          packing: { type: Number, default: 1 },
+          purchaseQty: { type: Number, default: 1 },
+          salesQty: { type: Number, default: 1 },
+          minStockQty: { type: Number, default: 0 },
+          weightPerPiece: { type: Number, default: 0 },
+          schemeRemark: { type: String, default: "" },
+          openingStockFreshCase: { type: Number, default: 0 },
+          openingStockFreshPcs: { type: Number, default: 0 },
+          openingStockDamagedCase: { type: Number, default: 0 },
+          openingStockDamagedPcs: { type: Number, default: 0 },
+          // Per-godown breakdown of this MRP tier's stock. The flat opening-stock
+          // fields above are kept as a rollup (sum across godownStock) for backward
+          // compatibility with anything still reading them directly.
+          godownStock: {
+            type: [
+              {
+                godownId: {
+                  type: mongoose.Schema.Types.ObjectId,
+                  ref: "Godown",
+                  required: true,
+                },
+                openingStockFreshCase: { type: Number, default: 0 },
+                openingStockFreshPcs: { type: Number, default: 0 },
+                openingStockDamagedCase: { type: Number, default: 0 },
+                openingStockDamagedPcs: { type: Number, default: 0 },
+              },
+            ],
+            default: [],
+          },
+        },
+      ],
+      default: [],
+    },
     isActive: {
       type: Boolean,
       default: true,
@@ -116,7 +173,13 @@ const ItemSchema = new mongoose.Schema(
   }
 );
 
-ItemSchema.index({ companyId: 1, itemName: 1 }, { unique: true });
+// Item + Sub Group together identify a unique product — the same Item Name can
+// legitimately repeat across different Sub Groups (e.g. "Namkeen" under both
+// "Ratlami Sev" and "Nylon Sev" as distinct varieties), so uniqueness is no longer
+// on itemName alone. itemSubGroupId is nullable (Sub Group is optional on Items),
+// and Mongo's compound unique index still correctly rejects two items sharing the
+// same {companyId, itemName, itemSubGroupId: null} (no Sub Group at all).
+ItemSchema.index({ companyId: 1, itemName: 1, itemSubGroupId: 1 }, { unique: true });
 
 ItemSchema.index({ companyId: 1, createdAt: -1 });
 

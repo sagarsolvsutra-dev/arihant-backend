@@ -1,5 +1,6 @@
 const OpeningBill = require("../models/OpeningBill");
 const Customer = require("../models/Customer");
+const { sendError } = require("../utils/errorHandler");
 
 const getOpeningBills = async (req, res) => {
   try {
@@ -19,7 +20,7 @@ const getOpeningBills = async (req, res) => {
 
     res.status(200).json(bills);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -59,7 +60,7 @@ const createOpeningBill = async (req, res) => {
 
     res.status(201).json(bill);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -97,7 +98,7 @@ const updateOpeningBill = async (req, res) => {
     await bill.save();
     res.status(200).json(bill);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -110,7 +111,7 @@ const deleteOpeningBill = async (req, res) => {
     await bill.deleteOne();
     res.status(200).json({ message: "Opening Bill deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 

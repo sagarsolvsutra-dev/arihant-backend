@@ -1,4 +1,5 @@
 const Salesman = require("../models/Salesman");
+const { sendError } = require("../utils/errorHandler");
 
 const getSalesmen = async (req, res) => {
   try {
@@ -34,7 +35,7 @@ const getSalesmen = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -62,7 +63,7 @@ const createSalesman = async (req, res) => {
 
     res.status(201).json(salesman);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -92,7 +93,7 @@ const updateSalesman = async (req, res) => {
     await salesman.save();
     res.status(200).json(salesman);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -105,7 +106,7 @@ const deleteSalesman = async (req, res) => {
     await salesman.deleteOne();
     res.status(200).json({ message: "Salesman deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 

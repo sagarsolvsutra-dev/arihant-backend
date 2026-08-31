@@ -12,9 +12,9 @@ const ItemSubGroupSchema = new mongoose.Schema(
       required: true,
     },
 
-    itemGroupId: {
+    supplierId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "ItemGroup",
+      ref: "Supplier",
     },
     itemNameId: {
       type: mongoose.Schema.Types.ObjectId,

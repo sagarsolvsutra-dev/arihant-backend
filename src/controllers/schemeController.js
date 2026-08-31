@@ -20,7 +20,6 @@ const getSchemes = async (req, res) => {
 
     const [schemes, total] = await Promise.all([
       Scheme.find(query)
-        .populate("itemGroupId", "name")
         .populate("customerId", "name")
         .sort({ createdAt: -1 }).lean()
         .skip(skip)
@@ -38,7 +37,7 @@ const getSchemes = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -62,7 +61,7 @@ const createScheme = async (req, res) => {
 
     res.status(201).json(scheme);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -85,7 +84,7 @@ const updateScheme = async (req, res) => {
     await scheme.save();
     res.status(200).json(scheme);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -98,7 +97,7 @@ const deleteScheme = async (req, res) => {
     await scheme.deleteOne();
     res.status(200).json({ message: "Scheme deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 

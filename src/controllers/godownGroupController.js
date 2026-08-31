@@ -1,7 +1,7 @@
-const SupplierGroup = require("../models/SupplierGroup");
+const GodownGroup = require("../models/GodownGroup");
 const { sendError } = require("../utils/errorHandler");
 
-const getSupplierGroups = async (req, res) => {
+const getGodownGroups = async (req, res) => {
   try {
     const { companyId, page = 1, limit = 10, search = "" } = req.query;
     if (!companyId) {
@@ -17,8 +17,8 @@ const getSupplierGroups = async (req, res) => {
     const parsedLimit = parseInt(limit);
 
     const [groups, total] = await Promise.all([
-      SupplierGroup.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
-      SupplierGroup.countDocuments(query)
+      GodownGroup.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
+      GodownGroup.countDocuments(query)
     ]);
 
     res.status(200).json({
@@ -35,19 +35,19 @@ const getSupplierGroups = async (req, res) => {
   }
 };
 
-const createSupplierGroup = async (req, res) => {
+const createGodownGroup = async (req, res) => {
   try {
     const { companyId, name } = req.body;
     if (!companyId || !name) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
-    const groupExists = await SupplierGroup.findOne({ companyId, name });
+    const groupExists = await GodownGroup.findOne({ companyId, name });
     if (groupExists) {
-      return res.status(400).json({ message: "Supplier Group already exists in this company" });
+      return res.status(400).json({ message: "Godown Group already exists in this company" });
     }
 
-    const group = await SupplierGroup.create({
+    const group = await GodownGroup.create({
       companyId,
       name,
     });
@@ -58,19 +58,19 @@ const createSupplierGroup = async (req, res) => {
   }
 };
 
-const updateSupplierGroup = async (req, res) => {
+const updateGodownGroup = async (req, res) => {
   try {
     const { name } = req.body;
-    const group = await SupplierGroup.findById(req.params.id);
+    const group = await GodownGroup.findById(req.params.id);
 
     if (!group) {
-      return res.status(404).json({ message: "Supplier Group not found" });
+      return res.status(404).json({ message: "Godown Group not found" });
     }
 
     if (name) {
-      const exists = await SupplierGroup.findOne({ companyId: group.companyId, name, _id: { $ne: req.params.id } });
+      const exists = await GodownGroup.findOne({ companyId: group.companyId, name, _id: { $ne: req.params.id } });
       if (exists) {
-        return res.status(400).json({ message: "Another Supplier Group already exists with this name" });
+        return res.status(400).json({ message: "Another Godown Group already exists with this name" });
       }
       group.name = name;
     }
@@ -82,22 +82,22 @@ const updateSupplierGroup = async (req, res) => {
   }
 };
 
-const deleteSupplierGroup = async (req, res) => {
+const deleteGodownGroup = async (req, res) => {
   try {
-    const group = await SupplierGroup.findById(req.params.id);
+    const group = await GodownGroup.findById(req.params.id);
     if (!group) {
-      return res.status(404).json({ message: "Supplier Group not found" });
+      return res.status(404).json({ message: "Godown Group not found" });
     }
     await group.deleteOne();
-    res.status(200).json({ message: "Supplier Group deleted successfully" });
+    res.status(200).json({ message: "Godown Group deleted successfully" });
   } catch (error) {
     res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
 module.exports = {
-  getSupplierGroups,
-  createSupplierGroup,
-  updateSupplierGroup,
-  deleteSupplierGroup,
+  getGodownGroups,
+  createGodownGroup,
+  updateGodownGroup,
+  deleteGodownGroup,
 };

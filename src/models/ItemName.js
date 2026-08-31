@@ -7,9 +7,9 @@ const ItemNameSchema = new mongoose.Schema(
       ref: "Company",
       required: true,
     },
-    itemGroupId: {
+    supplierId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "ItemGroup",
+      ref: "Supplier",
       required: true,
     },
     name: {
@@ -27,7 +27,7 @@ const ItemNameSchema = new mongoose.Schema(
   }
 );
 
-ItemNameSchema.index({ companyId: 1, itemGroupId: 1, name: 1 }, { unique: true });
+ItemNameSchema.index({ companyId: 1, supplierId: 1, name: 1 }, { unique: true });
 
 ItemNameSchema.index({ companyId: 1, createdAt: -1 });
 

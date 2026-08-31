@@ -55,7 +55,7 @@ const app = express();
 app.use(helmet());
 app.use(cors({
   origin: [
-    "http://localhost:3000", 
+    "http://localhost:3000",
     "http://localhost:3001",
     "https://arihant-frontend-seven.vercel.app",
     process.env.FRONTEND_URL
@@ -75,11 +75,12 @@ app.use("/api/hsn", hsnRoutes);
 app.use("/api/companies", require("./routes/companyRoutes"));
 app.use("/api/users", require("./routes/userRoutes"));
 // Master Routes
-app.use("/api/item-groups", require("./routes/itemGroupRoutes"));
 app.use("/api/item-names", require("./routes/itemNameRoutes"));
 app.use("/api/item-sub-groups", require("./routes/itemSubGroupRoutes"));
 app.use("/api/customer-groups", require("./routes/customerGroupRoutes"));
 app.use("/api/supplier-groups", require("./routes/supplierGroupRoutes"));
+app.use("/api/godown-groups", require("./routes/godownGroupRoutes"));
+app.use("/api/godowns", require("./routes/godownRoutes"));
 app.use("/api/hsn", require("./routes/hsnRoutes"));
 
 // Data Routes
@@ -89,6 +90,10 @@ app.use("/api/suppliers", require("./routes/supplierRoutes"));
 app.use("/api/salesmen", require("./routes/salesmanRoutes"));
 app.use("/api/schemes", require("./routes/schemeRoutes"));
 app.use("/api/opening-bills", require("./routes/openingBillRoutes"));
+app.use("/api/purchases", require("./routes/purchaseRoutes"));
+app.use("/api/sales", require("./routes/saleRoutes"));
+app.use("/api/purchase-returns", require("./routes/purchaseReturnRoutes"));
+app.use("/api/sale-returns", require("./routes/saleReturnRoutes"));
 
 // Health Check
 app.get("/health", (req, res) => {
@@ -104,7 +109,7 @@ app.use((err, req, res, next) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT;
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);

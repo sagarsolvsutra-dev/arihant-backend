@@ -1,8 +1,9 @@
 const Customer = require("../models/Customer");
+const { sendError } = require("../utils/errorHandler");
 
 const getCustomers = async (req, res) => {
   try {
-    const { companyId, page = 1, limit = 10, search = "" } = req.query;
+    const { companyId, page = 1, limit = 10, search = "", customerType = "" } = req.query;
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
@@ -15,6 +16,9 @@ const getCustomers = async (req, res) => {
         { email: { $regex: search, $options: "i" } },
         { city: { $regex: search, $options: "i" } }
       ];
+    }
+    if (customerType) {
+      query.customerType = customerType;
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -39,7 +43,19 @@ const getCustomers = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
+const getCustomerById = async (req, res) => {
+  try {
+    const customer = await Customer.findById(req.params.id).populate("customerGroupId", "name");
+    if (!customer) {
+      return res.status(404).json({ message: "Customer not found" });
+    }
+    res.status(200).json(customer);
+  } catch (error) {
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -88,7 +104,7 @@ const createCustomer = async (req, res) => {
 
     res.status(201).json(customer);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -138,7 +154,7 @@ const updateCustomer = async (req, res) => {
     await customer.save();
     res.status(200).json(customer);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -151,12 +167,13 @@ const deleteCustomer = async (req, res) => {
     await customer.deleteOne();
     res.status(200).json({ message: "Customer deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
 module.exports = {
   getCustomers,
+  getCustomerById,
   createCustomer,
   updateCustomer,
   deleteCustomer,

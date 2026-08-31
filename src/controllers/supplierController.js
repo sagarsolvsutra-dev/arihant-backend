@@ -1,4 +1,5 @@
 const Supplier = require("../models/Supplier");
+const { sendError } = require("../utils/errorHandler");
 
 const getSuppliers = async (req, res) => {
   try {
@@ -39,7 +40,19 @@ const getSuppliers = async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
+const getSupplierById = async (req, res) => {
+  try {
+    const supplier = await Supplier.findById(req.params.id).populate("supplierGroupId", "name");
+    if (!supplier) {
+      return res.status(404).json({ message: "Supplier not found" });
+    }
+    res.status(200).json(supplier);
+  } catch (error) {
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
@@ -82,7 +95,7 @@ const createSupplier = async (req, res) => {
 
     res.status(201).json(supplier);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -126,7 +139,7 @@ const updateSupplier = async (req, res) => {
     await supplier.save();
     res.status(200).json(supplier);
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    sendError(res, error);
   }
 };
 
@@ -139,12 +152,13 @@ const deleteSupplier = async (req, res) => {
     await supplier.deleteOne();
     res.status(200).json({ message: "Supplier deleted successfully" });
   } catch (error) {
-    res.status(500).json({ message: "Server Error", error: error.message });
+    res.status(500).json({ message: error.message || "Server Error" });
   }
 };
 
 module.exports = {
   getSuppliers,
+  getSupplierById,
   createSupplier,
   updateSupplier,
   deleteSupplier,
