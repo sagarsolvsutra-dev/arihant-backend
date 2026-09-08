@@ -1,5 +1,7 @@
 const express = require("express");
 const router = express.Router();
+const { validateObjectIdParam } = require("../middlewares/validateObjectId");
+router.param("id", validateObjectIdParam);
 const itemNameController = require("../controllers/itemNameController");
 
 router.post("/", itemNameController.createItemName);

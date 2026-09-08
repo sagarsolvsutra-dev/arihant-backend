@@ -11,6 +11,13 @@ const PurchaseItemSchema = new mongoose.Schema(
     packing: { type: Number, default: 1 },
     purchaseQty: { type: Number, default: 1 },
     mrp: { type: Number, default: 0 },
+    // Per-line, not per-invoice — a single Purchase can send different items to
+    // different godowns. Was header-level until an explicit request to split it.
+    godownId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Godown",
+      required: true,
+    },
     caseQty: { type: Number, default: 0 },
     pcsQty: { type: Number, default: 0 },
     freeQty: { type: Number, default: 0 },
@@ -40,11 +47,7 @@ const PurchaseSchema = new mongoose.Schema(
     invoiceNo: { type: String, required: true, trim: true },
     invoiceDate: { type: Date, required: true },
     receivingDate: { type: Date, default: null },
-    godownId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Godown",
-      required: true,
-    },
+    ewayBillNo: { type: String, default: "", trim: true },
     notes: { type: String, default: "" },
 
     items: {

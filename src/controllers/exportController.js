@@ -62,30 +62,32 @@ function fmtDate(d) {
 
 // godownId === "all" (the sentinel the frontend sends when nothing is picked —
 // never a real value, since Mongo ObjectIds can't be the literal string "all")
-// means "every godown in this company" — no godownId filter, and each row carries
-// its own godownName (from godownNameMap) since rows can now span many godowns.
+// means "every godown in this company". Godown is now per-LINE, not per-document
+// (a single invoice can span several godowns), so filtering happens per-line below
+// rather than as a Mongo-level document filter, and godownName is resolved per-line too.
 async function buildRows(type, companyId, godownId, godownNameMap) {
   const config = TYPE_CONFIG[type];
   const isAllGodowns = !godownId || godownId === "all";
-  const filter = isAllGodowns ? { companyId } : { companyId, godownId };
-  let query = config.model.find(filter);
+  let query = config.model.find({ companyId });
   if (config.populatePath) query = query.populate(config.populatePath, "name");
   const records = await query.sort({ [config.dateField]: -1 }).lean();
 
   const rows = [];
   records.forEach((rec) => {
     const partyName = config.populatePath ? rec[config.populatePath]?.name || "-" : undefined;
-    const godownName = isAllGodowns ? godownNameMap.get(String(rec.godownId)) || "-" : undefined;
     (rec.items || []).forEach((line) => {
+      if (!isAllGodowns && String(line.godownId) !== String(godownId)) return;
       rows.push({
         no: rec[config.noField],
         date: fmtDate(rec[config.dateField]),
-        godownName,
+        godownName: isAllGodowns ? godownNameMap.get(String(line.godownId)) || "-" : undefined,
         party: partyName,
         itemName: line.itemName,
         caseQty: line.caseQty || 0,
         pcsQty: line.pcsQty || 0,
-        condition: config.hasCondition ? (line.condition === "Damaged" ? "Expired" : "Fresh") : undefined,
+        // condition is now stored directly as one of the 3 real display values
+        // (Fresh/Expired/Damaged) — no remapping needed.
+        condition: config.hasCondition ? line.condition || "Fresh" : undefined,
         rate: line[config.rateField] || 0,
         netValue: line.netValue || 0,
       });
@@ -208,7 +210,10 @@ const exportGodownTransactions = async (req, res) => {
     }
     const isAllTypes = type === "all";
     const types = isAllTypes ? Object.keys(TYPE_CONFIG) : [type];
-    if (!isAllTypes && !TYPE_CONFIG[type]) {
+    // Object.prototype.hasOwnProperty guards against `type` being an inherited key
+    // name (e.g. "constructor", "toString") — a plain `!TYPE_CONFIG[type]` truthiness
+    // check would let those through as if they were a real, configured type.
+    if (!isAllTypes && !Object.prototype.hasOwnProperty.call(TYPE_CONFIG, type)) {
       return res.status(400).json({ message: "Invalid type — must be purchase, sale, purchaseReturn, saleReturn, or all" });
     }
     if (format !== "pdf" && format !== "excel") {

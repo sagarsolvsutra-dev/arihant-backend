@@ -1,5 +1,7 @@
 const SupplierGroup = require("../models/SupplierGroup");
+const Supplier = require("../models/Supplier");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getSupplierGroups = async (req, res) => {
   try {
@@ -10,11 +12,12 @@ const getSupplierGroups = async (req, res) => {
 
     const query = { companyId };
     if (search) {
-      query.name = { $regex: search, $options: "i" };
+      query.name = searchRegex(search);
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [groups, total] = await Promise.all([
       SupplierGroup.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
@@ -25,7 +28,7 @@ const getSupplierGroups = async (req, res) => {
       data: groups,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -88,6 +91,12 @@ const deleteSupplierGroup = async (req, res) => {
     if (!group) {
       return res.status(404).json({ message: "Supplier Group not found" });
     }
+
+    const hasSupplier = await Supplier.exists({ companyId: group.companyId, supplierGroupId: group._id });
+    if (hasSupplier) {
+      return res.status(400).json({ message: "Cannot delete this group — one or more Suppliers still belong to it." });
+    }
+
     await group.deleteOne();
     res.status(200).json({ message: "Supplier Group deleted successfully" });
   } catch (error) {

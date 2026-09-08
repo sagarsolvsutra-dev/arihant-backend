@@ -13,6 +13,13 @@ const SaleReturnItemSchema = new mongoose.Schema(
     packing: { type: Number, default: 1 },
     salesQty: { type: Number, default: 1 },
     mrp: { type: Number, default: 0 },
+    // Per-line, not per-invoice — a single return can bring different items back
+    // into different godowns. Was header-level until an explicit request to split it.
+    godownId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Godown",
+      required: true,
+    },
     caseQty: { type: Number, default: 0 },
     pcsQty: { type: Number, default: 0 },
     freeQty: { type: Number, default: 0 },
@@ -29,9 +36,10 @@ const SaleReturnItemSchema = new mongoose.Schema(
     gstAmount: { type: Number, default: 0 },
     netValue: { type: Number, default: 0 },
     // Fresh = resellable, added back into the sellable Fresh stock bucket.
-    // Damaged = recorded in the Damaged stock bucket instead — visible on stock
-    // pages but not counted as sellable inventory. See saleReturnController.applyStockDelta.
-    condition: { type: String, enum: ["Fresh", "Damaged"], default: "Fresh" },
+    // Expired / Damaged = recorded in their own respective stock buckets instead —
+    // visible on stock pages but not counted as sellable inventory. See
+    // saleReturnController.applyStockDelta.
+    condition: { type: String, enum: ["Fresh", "Expired", "Damaged"], default: "Fresh" },
   },
   { _id: false }
 );
@@ -45,11 +53,6 @@ const SaleReturnSchema = new mongoose.Schema(
     },
     returnNo: { type: String, required: true, trim: true },
     returnDate: { type: Date, required: true },
-    godownId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Godown",
-      required: true,
-    },
     // Real, persisted field — same as Sale.customerId (a return is customer-linked,
     // and can be auto-filled directly from the original Sale once it's looked up).
     customerId: {

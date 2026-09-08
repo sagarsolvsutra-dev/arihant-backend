@@ -1,5 +1,7 @@
 const Purchase = require("../models/Purchase");
 const Item = require("../models/Item");
+const Godown = require("../models/Godown");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 // Finds which of the item's mrpEntries the client is purchasing against, by
 // matching on MRP (guaranteed unique per item) — never trusts client-supplied
@@ -29,8 +31,16 @@ function computeLine(raw, item) {
 
   // Never trust the client to have blocked negative input — a negative quantity or
   // rate here would silently corrupt Item stock via applyStockDelta.
-  if (caseQty < 0 || pcsQty < 0 || freeQty < 0 || beforeGstRate < 0 || lessRs < 0 || cdRs < 0) {
+  if (caseQty < 0 || pcsQty < 0 || freeQty < 0 || beforeGstRate < 0 || lessRs < 0 || cdRs < 0 || lessPercent < 0 || cdPercent < 0) {
     throw new Error(`Quantities and rates cannot be negative (item: ${item.itemName})`);
+  }
+  if (caseQty === 0 && pcsQty === 0) {
+    throw new Error(`Enter a Case or Pcs quantity greater than 0 (item: ${item.itemName})`);
+  }
+  // Each line now owns its own godown — required so applyStockDelta/assertSufficientStock
+  // know which per-godown stock bucket this line's quantity affects.
+  if (!raw.godownId) {
+    throw new Error(`Godown is required for each item line (item: ${item.itemName})`);
   }
 
   const billedPieces = caseQty * packing + pcsQty;
@@ -40,6 +50,11 @@ function computeLine(raw, item) {
   const amount = pricePerPiece * billedPieces;
   const lessAmt = (amount * lessPercent) / 100 + lessRs;
   const cdAmt = (amount * cdPercent) / 100 + cdRs;
+  // Discounts can never exceed the line's own amount — otherwise taxableValue/netValue
+  // go negative with no error anywhere, silently corrupting the invoice total.
+  if (lessAmt + cdAmt > amount + 1e-6) {
+    throw new Error(`Discounts cannot exceed the line amount (item: ${item.itemName})`);
+  }
   const taxableValue = amount - lessAmt - cdAmt;
   const gstAmount = (taxableValue * gstPercent) / 100;
   const netValue = taxableValue + gstAmount;
@@ -60,6 +75,7 @@ function computeLine(raw, item) {
     packing,
     purchaseQty,
     mrp: raw.mrp !== undefined ? parseFloat(raw.mrp) || 0 : parseFloat(item.mrp) || 0,
+    godownId: raw.godownId,
     caseQty,
     pcsQty,
     freeQty,
@@ -104,37 +120,50 @@ function computeTotals(lines) {
   );
 }
 
-// Builds validated + recomputed lines from raw client input, keyed against
-// the real Item documents (rate/gst/packing snapshots come from the DB, not the client).
-async function buildLines(rawItems) {
+// Builds validated + recomputed lines from raw client input, keyed against the real
+// Item documents (rate/gst/packing snapshots come from the DB, not the client). Both
+// Items and Godowns are scoped to `companyId` — without this, a line whose
+// itemId/godownId belongs to a DIFFERENT company would still resolve successfully
+// and applyStockDelta would silently mutate that other company's live stock.
+async function buildLines(rawItems, companyId) {
   if (!Array.isArray(rawItems) || rawItems.length === 0) {
     throw new Error("At least one item is required");
   }
 
   const itemIds = rawItems.map((r) => r.itemId);
-  const items = await Item.find({ _id: { $in: itemIds } });
+  const items = await Item.find({ _id: { $in: itemIds }, companyId });
   const itemMap = new Map(items.map((i) => [String(i._id), i]));
+
+  const godownIds = [...new Set(rawItems.map((r) => r.godownId).filter(Boolean))];
+  const godowns = await Godown.find({ _id: { $in: godownIds }, companyId });
+  const allowedGodownIds = new Set(godowns.map((g) => String(g._id)));
 
   return rawItems.map((raw) => {
     const item = itemMap.get(String(raw.itemId));
     if (!item) {
       throw new Error(`Item not found: ${raw.itemId}`);
     }
+    if (raw.godownId && !allowedGodownIds.has(String(raw.godownId))) {
+      throw new Error(`Godown not found: ${raw.godownId}`);
+    }
     return computeLine(raw, item);
   });
 }
 
-// sign = +1 to apply a purchase's stock effect, -1 to reverse it. godownId identifies
-// which physical warehouse bucket the stock moves in/out of.
+// sign = +1 to apply a purchase's stock effect, -1 to reverse it. Each line carries
+// its own godownId, identifying which physical warehouse bucket that line's stock
+// moves in/out of — a single purchase can span several godowns across its lines.
+// `companyId` scopes the Item lookup so a line can never mutate a different
+// company's Item document.
 //
 // Item/MRP-entry flat opening-stock fields are incremented directly (never recomputed
 // as a sum of godownStock buckets) — Items add/edit lets a user set opening stock
 // without picking a godown at all, so those buckets don't necessarily cover the whole
 // flat total. godownStock[] is purely a Purchase-driven, godown-scoped view alongside
 // the flat total, not its source of truth.
-async function applyStockDelta(lines, sign, godownId) {
+async function applyStockDelta(lines, sign, companyId) {
   for (const line of lines) {
-    const item = await Item.findById(line.itemId);
+    const item = await Item.findOne({ _id: line.itemId, companyId });
     if (!item) continue;
 
     const packing = parseFloat(item.packing) || 1;
@@ -147,9 +176,17 @@ async function applyStockDelta(lines, sign, godownId) {
       matchedEntry.openingStockFreshCase = entryPacking > 0 ? entryNewPcs / entryPacking : entryNewPcs;
 
       if (!Array.isArray(matchedEntry.godownStock)) matchedEntry.godownStock = [];
-      let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(godownId));
+      let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(line.godownId));
       if (!bucket) {
-        bucket = { godownId, openingStockFreshCase: 0, openingStockFreshPcs: 0, openingStockDamagedCase: 0, openingStockDamagedPcs: 0 };
+        bucket = {
+          godownId: line.godownId,
+          openingStockFreshCase: 0,
+          openingStockFreshPcs: 0,
+          openingStockExpiredCase: 0,
+          openingStockExpiredPcs: 0,
+          openingStockDamagedCase: 0,
+          openingStockDamagedPcs: 0,
+        };
         matchedEntry.godownStock.push(bucket);
         bucket = matchedEntry.godownStock[matchedEntry.godownStock.length - 1];
       }
@@ -181,19 +218,20 @@ async function applyStockDelta(lines, sign, godownId) {
 // have already been consumed by a downstream Sale or Purchase Return. Mirrors
 // saleController.assertSufficientStock exactly; used only by delete/update below,
 // checked against CURRENT stock before the removal is allowed to proceed.
-async function assertSufficientStock(lines, godownId) {
+// `companyId` scopes the Item lookup to prevent cross-tenant reads.
+async function assertSufficientStock(lines, companyId) {
   const neededByKey = new Map();
   const nameByKey = new Map();
   for (const line of lines) {
-    const key = `${line.itemId}|${line.mrp}`;
+    const key = `${line.itemId}|${line.mrp}|${String(line.godownId)}`;
     neededByKey.set(key, (neededByKey.get(key) || 0) + line.totalPieces);
     nameByKey.set(key, line.itemName);
   }
 
   for (const [key, needed] of neededByKey.entries()) {
-    const [itemId, mrpStr] = key.split("|");
+    const [itemId, mrpStr, godownIdStr] = key.split("|");
     const mrp = parseFloat(mrpStr);
-    const item = await Item.findById(itemId);
+    const item = await Item.findOne({ _id: itemId, companyId });
     if (!item) continue;
     const matchedEntry = Array.isArray(item.mrpEntries)
       ? item.mrpEntries.find((e) => parseFloat(e.mrp) === mrp)
@@ -204,7 +242,7 @@ async function assertSufficientStock(lines, godownId) {
     // ever undoes that same unconditional flat-field delta, which is always safe;
     // there is no bucket to be insufficient against, so skip the check for it.
     if (!matchedEntry) continue;
-    const bucket = matchedEntry.godownStock?.find((g) => String(g.godownId) === String(godownId));
+    const bucket = matchedEntry.godownStock?.find((g) => String(g.godownId) === godownIdStr);
     const available = parseFloat(bucket?.openingStockFreshPcs) || 0;
     if (available < needed) {
       throw new Error(
@@ -222,10 +260,11 @@ const getPurchases = async (req, res) => {
     }
 
     const query = { companyId };
-    if (search) query.invoiceNo = { $regex: search, $options: "i" };
+    if (search) query.invoiceNo = searchRegex(search);
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [purchases, total] = await Promise.all([
       Purchase.find(query)
@@ -240,7 +279,7 @@ const getPurchases = async (req, res) => {
       data: purchases,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit),
       },
@@ -263,10 +302,11 @@ const getPurchaseById = async (req, res) => {
 };
 
 const createPurchase = async (req, res) => {
+  let purchase;
   try {
-    const { companyId, invoiceNo, invoiceDate, receivingDate, godownId, notes, items, paidAmount, dueDate } = req.body;
+    const { companyId, invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate } = req.body;
 
-    if (!companyId || !invoiceNo || !invoiceDate || !godownId) {
+    if (!companyId || !invoiceNo || !invoiceDate) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
@@ -275,16 +315,16 @@ const createPurchase = async (req, res) => {
       return res.status(400).json({ message: "This invoice number already exists" });
     }
 
-    const lines = await buildLines(items);
+    const lines = await buildLines(items, companyId);
     const totals = computeTotals(lines);
     const paid = parseFloat(paidAmount) || 0;
 
-    const purchase = await Purchase.create({
+    purchase = await Purchase.create({
       companyId,
       invoiceNo: invoiceNo.trim(),
       invoiceDate,
       receivingDate: receivingDate || null,
-      godownId,
+      ewayBillNo: ewayBillNo || "",
       notes: notes || "",
       items: lines,
       ...totals,
@@ -293,7 +333,14 @@ const createPurchase = async (req, res) => {
       dueDate: dueDate || null,
     });
 
-    await applyStockDelta(lines, 1, godownId);
+    try {
+      await applyStockDelta(lines, 1, companyId);
+    } catch (stockErr) {
+      // The document already committed but its stock effect failed partway through —
+      // delete it rather than leave a Purchase on the books with no matching stock change.
+      await Purchase.deleteOne({ _id: purchase._id });
+      throw stockErr;
+    }
 
     res.status(201).json(purchase);
   } catch (error) {
@@ -307,8 +354,13 @@ const updatePurchase = async (req, res) => {
     if (!purchase) {
       return res.status(404).json({ message: "Purchase not found" });
     }
+    const companyId = purchase.companyId;
+    // Captured before any mutation — `purchase.items` is reassigned below, so the
+    // rollback path (if buildLines/`.save()`/the reapply throws) must reverse using
+    // this original snapshot, not whatever `purchase.items` has since become.
+    const oldItems = purchase.items;
 
-    const { invoiceNo, invoiceDate, receivingDate, godownId, notes, items, paidAmount, dueDate } = req.body;
+    const { invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate } = req.body;
 
     if (invoiceNo && invoiceNo.trim() !== purchase.invoiceNo) {
       const exists = await Purchase.findOne({
@@ -323,35 +375,40 @@ const updatePurchase = async (req, res) => {
 
     // Reversing this purchase's OLD stock effect can only proceed if that stock is
     // still actually there — some of it may have already moved out via a downstream
-    // Sale or Purchase Return. Check BEFORE touching anything.
-    const oldGodownId = purchase.godownId;
-    await assertSufficientStock(purchase.items, oldGodownId);
-    await applyStockDelta(purchase.items, -1, oldGodownId);
+    // Sale or Purchase Return. Check BEFORE touching anything. Each old line already
+    // carries its own godownId, so this reverses each line against its own godown —
+    // no shared "old godown" concept needed even though lines can span several.
+    await assertSufficientStock(oldItems, companyId);
+    await applyStockDelta(oldItems, -1, companyId);
 
-    let lines, totals;
     try {
-      lines = await buildLines(items || purchase.items);
-      totals = computeTotals(lines);
+      const lines = await buildLines(items || oldItems, companyId);
+      const totals = computeTotals(lines);
+
+      if (invoiceNo) purchase.invoiceNo = invoiceNo.trim();
+      if (invoiceDate) purchase.invoiceDate = invoiceDate;
+      if (receivingDate !== undefined) purchase.receivingDate = receivingDate || null;
+      if (ewayBillNo !== undefined) purchase.ewayBillNo = ewayBillNo;
+      if (notes !== undefined) purchase.notes = notes;
+      purchase.items = lines;
+      Object.assign(purchase, totals);
+
+      const paid = paidAmount !== undefined ? parseFloat(paidAmount) || 0 : purchase.paidAmount;
+      purchase.paidAmount = paid;
+      purchase.pendingAmount = totals.netAmount - paid;
+      if (dueDate !== undefined) purchase.dueDate = dueDate || null;
+
+      // The field mutation + save + reapply must all succeed together, or the
+      // reversal above must be undone — otherwise a validation/cast error thrown by
+      // `.save()` itself (not caught by buildLines, which never touches Mongoose
+      // validation) leaves the document unchanged in the DB while its stock has
+      // already been taken back, and a retry of the same bad request removes it again.
+      await purchase.save();
+      await applyStockDelta(lines, 1, companyId);
     } catch (err) {
-      await applyStockDelta(purchase.items, 1, oldGodownId);
+      await applyStockDelta(oldItems, 1, companyId);
       throw err;
     }
-
-    if (invoiceNo) purchase.invoiceNo = invoiceNo.trim();
-    if (invoiceDate) purchase.invoiceDate = invoiceDate;
-    if (receivingDate !== undefined) purchase.receivingDate = receivingDate || null;
-    if (godownId) purchase.godownId = godownId;
-    if (notes !== undefined) purchase.notes = notes;
-    purchase.items = lines;
-    Object.assign(purchase, totals);
-
-    const paid = paidAmount !== undefined ? parseFloat(paidAmount) || 0 : purchase.paidAmount;
-    purchase.paidAmount = paid;
-    purchase.pendingAmount = totals.netAmount - paid;
-    if (dueDate !== undefined) purchase.dueDate = dueDate || null;
-
-    await purchase.save();
-    await applyStockDelta(lines, 1, purchase.godownId);
 
     res.status(200).json(purchase);
   } catch (error) {
@@ -366,8 +423,8 @@ const deletePurchase = async (req, res) => {
       return res.status(404).json({ message: "Purchase not found" });
     }
 
-    await assertSufficientStock(purchase.items, purchase.godownId);
-    await applyStockDelta(purchase.items, -1, purchase.godownId);
+    await assertSufficientStock(purchase.items, purchase.companyId);
+    await applyStockDelta(purchase.items, -1, purchase.companyId);
     await purchase.deleteOne();
 
     res.status(200).json({ message: "Purchase deleted successfully" });

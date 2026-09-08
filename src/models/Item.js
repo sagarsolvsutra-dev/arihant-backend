@@ -97,6 +97,11 @@ const ItemSchema = new mongoose.Schema(
     distributorRate: { type: Number, default: 0 },
     openingStockFreshCase: { type: Number, default: 0 },
     openingStockFreshPcs: { type: Number, default: 0 },
+    // "Expired" (what the UI has always called this) — its own honestly-named field,
+    // split off from openingStockDamagedCase/Pcs so "Damaged" can be a real, separate
+    // third state below instead of the old field/label mismatch.
+    openingStockExpiredCase: { type: Number, default: 0 },
+    openingStockExpiredPcs: { type: Number, default: 0 },
     openingStockDamagedCase: { type: Number, default: 0 },
     openingStockDamagedPcs: { type: Number, default: 0 },
     lastCostRate: { type: Number, default: 0 },
@@ -138,6 +143,8 @@ const ItemSchema = new mongoose.Schema(
           schemeRemark: { type: String, default: "" },
           openingStockFreshCase: { type: Number, default: 0 },
           openingStockFreshPcs: { type: Number, default: 0 },
+          openingStockExpiredCase: { type: Number, default: 0 },
+          openingStockExpiredPcs: { type: Number, default: 0 },
           openingStockDamagedCase: { type: Number, default: 0 },
           openingStockDamagedPcs: { type: Number, default: 0 },
           // Per-godown breakdown of this MRP tier's stock. The flat opening-stock
@@ -153,6 +160,8 @@ const ItemSchema = new mongoose.Schema(
                 },
                 openingStockFreshCase: { type: Number, default: 0 },
                 openingStockFreshPcs: { type: Number, default: 0 },
+                openingStockExpiredCase: { type: Number, default: 0 },
+                openingStockExpiredPcs: { type: Number, default: 0 },
                 openingStockDamagedCase: { type: Number, default: 0 },
                 openingStockDamagedPcs: { type: Number, default: 0 },
               },
@@ -180,6 +189,17 @@ const ItemSchema = new mongoose.Schema(
 // and Mongo's compound unique index still correctly rejects two items sharing the
 // same {companyId, itemName, itemSubGroupId: null} (no Sub Group at all).
 ItemSchema.index({ companyId: 1, itemName: 1, itemSubGroupId: 1 }, { unique: true });
+
+// codeBarCode must be unique per company — a partial index so it only applies to
+// non-empty codes (codeBarCode is required client-side, but this stays safe for any
+// legacy row that somehow has one blank; multiple blanks don't collide with each other).
+// $gt: "" (not $ne) — partialFilterExpression only supports a limited operator set
+// ($eq/$exists/$gt/$gte/$lt/$lte/$type), and an empty string sorts before every
+// non-empty one, so this is equivalent to "codeBarCode is non-empty".
+ItemSchema.index(
+  { companyId: 1, codeBarCode: 1 },
+  { unique: true, partialFilterExpression: { codeBarCode: { $gt: "" } } }
+);
 
 ItemSchema.index({ companyId: 1, createdAt: -1 });
 

@@ -1,4 +1,5 @@
 const Scheme = require("../models/Scheme");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getSchemes = async (req, res) => {
   try {
@@ -10,18 +11,19 @@ const getSchemes = async (req, res) => {
     const query = { companyId };
     if (search) {
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } }
+        { name: searchRegex(search) },
+        { description: searchRegex(search) }
       ];
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [schemes, total] = await Promise.all([
       Scheme.find(query)
         .populate("customerId", "name")
-        .sort({ createdAt: -1 }).lean()
+        .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parsedLimit).lean(),
       Scheme.countDocuments(query)
@@ -31,7 +33,7 @@ const getSchemes = async (req, res) => {
       data: schemes,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }

@@ -11,6 +11,13 @@ const SaleItemSchema = new mongoose.Schema(
     packing: { type: Number, default: 1 },
     salesQty: { type: Number, default: 1 },
     mrp: { type: Number, default: 0 },
+    // Per-line, not per-invoice — a single Sale can move different items out of
+    // different godowns. Was header-level until an explicit request to split it.
+    godownId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Godown",
+      required: true,
+    },
     caseQty: { type: Number, default: 0 },
     pcsQty: { type: Number, default: 0 },
     freeQty: { type: Number, default: 0 },
@@ -52,11 +59,6 @@ const SaleSchema = new mongoose.Schema(
     invoiceNo: { type: String, required: true, trim: true },
     invoiceDate: { type: Date, required: true },
     deliveryDate: { type: Date, default: null },
-    godownId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Godown",
-      required: true,
-    },
     customerId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Customer",

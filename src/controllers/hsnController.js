@@ -1,5 +1,6 @@
 const Hsn = require("../models/Hsn");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 // @desc    Get all HSN codes for a company
 // @route   GET /api/hsn
@@ -15,13 +16,14 @@ const getHsnCodes = async (req, res) => {
     const query = { companyId };
     if (search) {
       query.$or = [
-        { hsnCode: { $regex: search, $options: "i" } },
-        { description: { $regex: search, $options: "i" } }
+        { hsnCode: searchRegex(search) },
+        { description: searchRegex(search) }
       ];
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [hsnCodes, total] = await Promise.all([
       Hsn.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
@@ -32,7 +34,7 @@ const getHsnCodes = async (req, res) => {
       data: hsnCodes,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }

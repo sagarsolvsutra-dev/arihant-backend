@@ -93,17 +93,44 @@ const createCompany = async (req, res) => {
     }
 
     const normalizedCode = code.toLowerCase().trim();
+    const trimmedName = name.trim();
 
-    const existing = await Company.findOne({ code: normalizedCode });
-    if (existing) {
+    const existingCode = await Company.findOne({ code: normalizedCode });
+    if (existingCode) {
       return res.status(400).json({
         success: false,
         message: "Company code already exists",
       });
     }
+    // Company.name also has its own unique index — checked explicitly here (not just
+    // relying on the DB to reject it) so a collision surfaces as this same clean 400
+    // instead of a raw Mongo E11000 message from an uncaught create() failure.
+    const existingName = await Company.findOne({ name: trimmedName });
+    if (existingName) {
+      return res.status(400).json({
+        success: false,
+        message: "A company with this name already exists",
+      });
+    }
+
+    // Validate the admin BEFORE creating the company — otherwise a bad admin email
+    // (checked below) rejects the request while the Company row it was validated
+    // against has already been permanently committed, leaving an orphaned,
+    // admin-less company with no way to discover it short of trial and error.
+    if (adminData && adminData.name && adminData.email && adminData.password) {
+      const existingUser = await User.findOne({
+        email: adminData.email.toLowerCase().trim(),
+      });
+      if (existingUser) {
+        return res.status(400).json({
+          success: false,
+          message: `Admin email ${adminData.email} already exists.`,
+        });
+      }
+    }
 
     const company = await Company.create({
-      name: name.trim(),
+      name: trimmedName,
       code: normalizedCode,
       address: address || "",
       phone: phone || "",
@@ -115,16 +142,6 @@ const createCompany = async (req, res) => {
 
     let createdUser = null;
     if (adminData && adminData.name && adminData.email && adminData.password) {
-      const existingUser = await User.findOne({
-        email: adminData.email.toLowerCase().trim(),
-      });
-      if (existingUser) {
-        return res.status(400).json({
-          success: false,
-          message: `Admin email ${adminData.email} already exists.`,
-        });
-      }
-
       const hashedPassword = encryptPassword(adminData.password);
       createdUser = await User.create({
         name: adminData.name.trim(),
@@ -182,6 +199,20 @@ const updateCompany = async (req, res) => {
     allowed.forEach((k) => {
       if (updates[k] !== undefined) set[k] = updates[k];
     });
+
+    // `runValidators` does not enforce uniqueness — a same-name collision would
+    // otherwise surface as a raw, uncaught Mongo E11000 500. Checked explicitly here.
+    if (set.name !== undefined) {
+      const trimmedName = String(set.name).trim();
+      set.name = trimmedName;
+      const existingName = await Company.findOne({ name: trimmedName, _id: { $ne: id } });
+      if (existingName) {
+        return res.status(400).json({
+          success: false,
+          message: "A company with this name already exists",
+        });
+      }
+    }
 
     const company = await Company.findByIdAndUpdate(id, set, {
       new: true,

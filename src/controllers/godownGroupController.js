@@ -1,5 +1,7 @@
 const GodownGroup = require("../models/GodownGroup");
+const Godown = require("../models/Godown");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getGodownGroups = async (req, res) => {
   try {
@@ -10,11 +12,12 @@ const getGodownGroups = async (req, res) => {
 
     const query = { companyId };
     if (search) {
-      query.name = { $regex: search, $options: "i" };
+      query.name = searchRegex(search);
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [groups, total] = await Promise.all([
       GodownGroup.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
@@ -25,7 +28,7 @@ const getGodownGroups = async (req, res) => {
       data: groups,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -88,6 +91,12 @@ const deleteGodownGroup = async (req, res) => {
     if (!group) {
       return res.status(404).json({ message: "Godown Group not found" });
     }
+
+    const hasGodown = await Godown.exists({ companyId: group.companyId, godownGroupId: group._id });
+    if (hasGodown) {
+      return res.status(400).json({ message: "Cannot delete this group — one or more Godowns still belong to it." });
+    }
+
     await group.deleteOne();
     res.status(200).json({ message: "Godown Group deleted successfully" });
   } catch (error) {

@@ -58,6 +58,7 @@ app.use(cors({
     "http://localhost:3000",
     "http://localhost:3001",
     "https://arihant-frontend-seven.vercel.app",
+    "http://localhost:64992",
     process.env.FRONTEND_URL
   ].filter(Boolean),
   credentials: true,
@@ -94,6 +95,7 @@ app.use("/api/purchases", require("./routes/purchaseRoutes"));
 app.use("/api/sales", require("./routes/saleRoutes"));
 app.use("/api/purchase-returns", require("./routes/purchaseReturnRoutes"));
 app.use("/api/sale-returns", require("./routes/saleReturnRoutes"));
+app.use("/api/stock-transfers", require("./routes/stockTransferRoutes"));
 
 // Health Check
 app.get("/health", (req, res) => {

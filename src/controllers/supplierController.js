@@ -1,5 +1,10 @@
 const Supplier = require("../models/Supplier");
+const Item = require("../models/Item");
+const ItemName = require("../models/ItemName");
+const ItemSubGroup = require("../models/ItemSubGroup");
+const PurchaseReturn = require("../models/PurchaseReturn");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getSuppliers = async (req, res) => {
   try {
@@ -11,20 +16,21 @@ const getSuppliers = async (req, res) => {
     const query = { companyId };
     if (search) {
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { phone: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } },
-        { city: { $regex: search, $options: "i" } }
+        { name: searchRegex(search) },
+        { phone: searchRegex(search) },
+        { email: searchRegex(search) },
+        { city: searchRegex(search) }
       ];
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [suppliers, total] = await Promise.all([
       Supplier.find(query)
         .populate("supplierGroupId", "name")
-        .sort({ createdAt: -1 }).lean()
+        .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parsedLimit).lean(),
       Supplier.countDocuments(query)
@@ -34,7 +40,7 @@ const getSuppliers = async (req, res) => {
       data: suppliers,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -149,6 +155,23 @@ const deleteSupplier = async (req, res) => {
     if (!supplier) {
       return res.status(404).json({ message: "Supplier not found" });
     }
+
+    // Item.supplierId, ItemName.supplierId (required), and ItemSubGroup.supplierId all
+    // reference Supplier; PurchaseReturn.supplierId is a real, required field. Hard-
+    // deleting a still-referenced Supplier leaves each of those with a dangling ref
+    // that silently resolves to null via .populate().
+    const [hasItem, hasItemName, hasItemSubGroup, hasPurchaseReturn] = await Promise.all([
+      Item.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
+      ItemName.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
+      ItemSubGroup.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
+      PurchaseReturn.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
+    ]);
+    if (hasItem || hasItemName || hasItemSubGroup || hasPurchaseReturn) {
+      return res.status(400).json({
+        message: "Cannot delete this supplier — it is still referenced by Items, Item Names, Item Sub Groups, or Purchase Returns. Deactivate it instead.",
+      });
+    }
+
     await supplier.deleteOne();
     res.status(200).json({ message: "Supplier deleted successfully" });
   } catch (error) {

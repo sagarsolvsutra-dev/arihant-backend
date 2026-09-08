@@ -1,5 +1,8 @@
 const Salesman = require("../models/Salesman");
+const Customer = require("../models/Customer");
+const OpeningBill = require("../models/OpeningBill");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getSalesmen = async (req, res) => {
   try {
@@ -11,14 +14,15 @@ const getSalesmen = async (req, res) => {
     const query = { companyId };
     if (search) {
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { phone: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } }
+        { name: searchRegex(search) },
+        { phone: searchRegex(search) },
+        { email: searchRegex(search) }
       ];
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [salesmen, total] = await Promise.all([
       Salesman.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
@@ -29,7 +33,7 @@ const getSalesmen = async (req, res) => {
       data: salesmen,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -103,6 +107,17 @@ const deleteSalesman = async (req, res) => {
     if (!salesman) {
       return res.status(404).json({ message: "Salesman not found" });
     }
+
+    const [hasCustomer, hasOpeningBill] = await Promise.all([
+      Customer.exists({ companyId: salesman.companyId, salesmanId: salesman._id }),
+      OpeningBill.exists({ companyId: salesman.companyId, salesmanId: salesman._id }),
+    ]);
+    if (hasCustomer || hasOpeningBill) {
+      return res.status(400).json({
+        message: "Cannot delete this salesman — still referenced by Customers or Opening Bills. Deactivate it instead.",
+      });
+    }
+
     await salesman.deleteOne();
     res.status(200).json({ message: "Salesman deleted successfully" });
   } catch (error) {

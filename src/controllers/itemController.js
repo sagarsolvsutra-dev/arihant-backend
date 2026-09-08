@@ -1,4 +1,10 @@
 const Item = require("../models/Item");
+const Purchase = require("../models/Purchase");
+const Sale = require("../models/Sale");
+const PurchaseReturn = require("../models/PurchaseReturn");
+const SaleReturn = require("../models/SaleReturn");
+const StockTransfer = require("../models/StockTransfer");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 // An item must always keep at least one MRP entry, and MRP values must stay
 // unique per item (Purchase's rate lookup identifies an entry by its MRP).
@@ -27,21 +33,22 @@ const getItems = async (req, res) => {
     const query = { companyId };
     if (search) {
       query.$or = [
-        { itemName: { $regex: search, $options: "i" } },
-        { alias: { $regex: search, $options: "i" } },
-        { hsnCode: { $regex: search, $options: "i" } },
-        { codeBarCode: { $regex: search, $options: "i" } }
+        { itemName: searchRegex(search) },
+        { alias: searchRegex(search) },
+        { hsnCode: searchRegex(search) },
+        { codeBarCode: searchRegex(search) }
       ];
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [items, total] = await Promise.all([
       Item.find(query)
         .populate("supplierId", "name")
         .populate("itemSubGroupId", "name")
-        .sort({ createdAt: -1 }).lean()
+        .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parsedLimit).lean(),
       Item.countDocuments(query)
@@ -51,7 +58,7 @@ const getItems = async (req, res) => {
       data: items,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -96,9 +103,23 @@ const createItem = async (req, res) => {
     // can legitimately repeat across different Sub Groups (see the matching index on
     // Item.js). itemSubGroupId is normalized to null the same way it's saved below,
     // so this check matches the index exactly regardless of "" vs undefined vs null.
-    const itemExists = await Item.findOne({ companyId, itemName, itemSubGroupId: itemSubGroupId || null });
+    // Trimmed the same way the persisted value below is trimmed — otherwise a name
+    // that trims down to an existing item's name (e.g. a trailing space) slips past
+    // this check and collides on `.create()` with a raw, unformatted 500 instead.
+    const trimmedItemName = itemName.trim();
+    const itemExists = await Item.findOne({ companyId, itemName: trimmedItemName, itemSubGroupId: itemSubGroupId || null });
     if (itemExists) {
       return res.status(400).json({ message: "An item with this name already exists in this Sub Group" });
+    }
+
+    // Code/BarCode must be unique per company — the same physical barcode can't
+    // identify two different items.
+    const trimmedCode = codeBarCode?.trim() || "";
+    if (trimmedCode) {
+      const codeExists = await Item.findOne({ companyId, codeBarCode: trimmedCode });
+      if (codeExists) {
+        return res.status(400).json({ message: "An item with this Code/BarCode already exists" });
+      }
     }
 
     // If the client didn't send explicit MRP entries, seed one from the flat pricing fields
@@ -230,17 +251,29 @@ const updateItem = async (req, res) => {
       mrpEntries
     } = req.body;
 
-    if (itemName) {
-      const exists = await Item.findOne({ companyId: item.companyId, itemName, _id: { $ne: req.params.id } });
+    // Item Name + Sub Group together identify a unique product (same rule as
+    // createItem/the compound index) — the same name can legitimately repeat across
+    // different Sub Groups, so this must check both, not itemName alone. Runs whenever
+    // either field is present in the request, using the EFFECTIVE post-update value for
+    // whichever one isn't being changed right now.
+    if (itemName !== undefined || itemSubGroupId !== undefined) {
+      const effectiveName = itemName !== undefined ? itemName.trim() : item.itemName;
+      const effectiveSubGroupId = itemSubGroupId !== undefined ? (itemSubGroupId || null) : (item.itemSubGroupId || null);
+      const exists = await Item.findOne({
+        companyId: item.companyId,
+        itemName: effectiveName,
+        itemSubGroupId: effectiveSubGroupId,
+        _id: { $ne: req.params.id },
+      });
       if (exists) {
-        return res.status(400).json({ message: "Another Item already exists with this name" });
+        return res.status(400).json({ message: "An item with this name already exists in this Sub Group" });
       }
-      item.itemName = itemName.trim();
     }
+    if (itemName !== undefined) item.itemName = itemName.trim();
 
     if (alias !== undefined) item.alias = alias.trim() || "";
     if (supplierId !== undefined) item.supplierId = supplierId;
-    if (itemSubGroupId !== undefined) item.itemSubGroupId = itemSubGroupId;
+    if (itemSubGroupId !== undefined) item.itemSubGroupId = itemSubGroupId || null;
     if (hsnCode !== undefined) item.hsnCode = hsnCode.trim() || "";
     if (uqcUnit !== undefined) item.uqcUnit = uqcUnit;
     if (purchaseRate !== undefined) item.purchaseRate = parseFloat(purchaseRate) || 0;
@@ -255,7 +288,20 @@ const updateItem = async (req, res) => {
     
     if (gstPercentage !== undefined) item.gstPercentage = parseFloat(gstPercentage) || 0;
     if (hsnPrint !== undefined) item.hsnPrint = hsnPrint.trim() || "";
-    if (codeBarCode !== undefined) item.codeBarCode = codeBarCode.trim() || "";
+    if (codeBarCode !== undefined) {
+      const trimmedCode = codeBarCode.trim() || "";
+      if (trimmedCode) {
+        const codeExists = await Item.findOne({
+          companyId: item.companyId,
+          codeBarCode: trimmedCode,
+          _id: { $ne: req.params.id },
+        });
+        if (codeExists) {
+          return res.status(400).json({ message: "Another item already exists with this Code/BarCode" });
+        }
+      }
+      item.codeBarCode = trimmedCode;
+    }
     if (packing !== undefined) item.packing = parseFloat(packing) || 1;
     if (weightPerPiece !== undefined) item.weightPerPiece = parseFloat(weightPerPiece) || 0;
     if (schemeRemark !== undefined) item.schemeRemark = schemeRemark.trim() || "";
@@ -289,7 +335,24 @@ const updateItem = async (req, res) => {
       if (mrpEntriesError) {
         return res.status(400).json({ message: mrpEntriesError });
       }
-      item.mrpEntries = mrpEntries;
+      // The Items Edit UI only ever sends pricing/opening-stock fields per entry — it
+      // never includes godownStock (a Purchase/Sale-driven side view the Items form
+      // has no field for). A raw replace here silently wiped out real per-godown
+      // stock history the moment any MRP entry was edited or reordered, even with no
+      // value changes. Preserve each existing entry's own godownStock by matching on
+      // MRP (the entry's identity key — see validateMrpEntries) and carrying it over
+      // onto the incoming entry, unless the client explicitly sent its own non-empty
+      // godownStock for that entry.
+      const existingGodownStockByMrp = new Map(
+        (item.mrpEntries || []).map((e) => [parseFloat(e.mrp) || 0, e.godownStock || []])
+      );
+      item.mrpEntries = mrpEntries.map((e) => ({
+        ...e,
+        godownStock:
+          Array.isArray(e.godownStock) && e.godownStock.length > 0
+            ? e.godownStock
+            : existingGodownStockByMrp.get(parseFloat(e.mrp) || 0) || [],
+      }));
     }
 
     await item.save();
@@ -305,6 +368,26 @@ const deleteItem = async (req, res) => {
     if (!item) {
       return res.status(404).json({ message: "Item not found" });
     }
+
+    // A deleted Item is looked up by every transactional controller's applyStockDelta
+    // / assertSufficientStock via `if (!item) continue;` — a silent skip, not an
+    // error — so deleting an item with real transaction history would silently
+    // disable stock-integrity checks for every past Purchase/Sale/Return/Transfer
+    // line that references it, letting a later edit/delete of one of those documents
+    // update/remove with no stock effect at all while still succeeding.
+    const [hasPurchase, hasSale, hasPurchaseReturn, hasSaleReturn, hasTransfer] = await Promise.all([
+      Purchase.exists({ companyId: item.companyId, "items.itemId": item._id }),
+      Sale.exists({ companyId: item.companyId, "items.itemId": item._id }),
+      PurchaseReturn.exists({ companyId: item.companyId, "items.itemId": item._id }),
+      SaleReturn.exists({ companyId: item.companyId, "items.itemId": item._id }),
+      StockTransfer.exists({ companyId: item.companyId, "items.itemId": item._id }),
+    ]);
+    if (hasPurchase || hasSale || hasPurchaseReturn || hasSaleReturn || hasTransfer) {
+      return res.status(400).json({
+        message: "Cannot delete this item — it has Purchase, Sale, Return, or Stock Transfer history. Deactivate it instead.",
+      });
+    }
+
     await item.deleteOne();
     res.status(200).json({ message: "Item deleted successfully" });
   } catch (error) {

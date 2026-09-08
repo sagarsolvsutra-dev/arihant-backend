@@ -1,4 +1,5 @@
 const ItemSubGroup = require("../models/ItemSubGroup");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getItemSubGroups = async (req, res) => {
   try {
@@ -6,14 +7,15 @@ const getItemSubGroups = async (req, res) => {
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
-    
+
     const query = { companyId };
     if (search) {
-      query.name = { $regex: search, $options: "i" };
+      query.name = searchRegex(search);
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [subGroups, total] = await Promise.all([
       ItemSubGroup.find(query).populate("itemNameId", "name").sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
@@ -24,7 +26,7 @@ const getItemSubGroups = async (req, res) => {
       data: subGroups,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -41,14 +43,14 @@ const createItemSubGroup = async (req, res) => {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
-    const exists = await ItemSubGroup.findOne({ companyId, name });
+    const exists = await ItemSubGroup.findOne({ companyId, name: name.trim() });
     if (exists) {
       return res.status(400).json({ message: "Item Sub Group already exists in this company" });
     }
 
     const subGroup = await ItemSubGroup.create({
       companyId,
-      name,
+      name: name.trim(),
       supplierId,
       itemNameId,
       isActive,
@@ -66,7 +68,22 @@ const updateItemSubGroup = async (req, res) => {
       return res.status(404).json({ message: "Item Sub Group not found" });
     }
 
-    if (req.body.name !== undefined) subGroup.name = req.body.name;
+    // Unique index is {companyId, name} — a rename that collides with an existing
+    // Sub Group in this company previously had no pre-check at all here, throwing a
+    // raw, unformatted Mongo E11000 as a 500 instead of a clean 400 (the sibling
+    // master controllers all already have this check).
+    if (req.body.name !== undefined) {
+      const trimmedName = req.body.name.trim();
+      const exists = await ItemSubGroup.findOne({
+        companyId: subGroup.companyId,
+        name: trimmedName,
+        _id: { $ne: subGroup._id },
+      });
+      if (exists) {
+        return res.status(400).json({ message: "Item Sub Group already exists in this company" });
+      }
+      subGroup.name = trimmedName;
+    }
 
     if (req.body.supplierId !== undefined) subGroup.supplierId = req.body.supplierId;
     if (req.body.itemNameId !== undefined) subGroup.itemNameId = req.body.itemNameId;

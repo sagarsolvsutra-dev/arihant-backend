@@ -1,5 +1,7 @@
 const CustomerGroup = require("../models/CustomerGroup");
+const Customer = require("../models/Customer");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getCustomerGroups = async (req, res) => {
   try {
@@ -10,11 +12,12 @@ const getCustomerGroups = async (req, res) => {
 
     const query = { companyId };
     if (search) {
-      query.name = { $regex: search, $options: "i" };
+      query.name = searchRegex(search);
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [groups, total] = await Promise.all([
       CustomerGroup.find(query).sort({ createdAt: -1 }).skip(skip).limit(parsedLimit).lean(),
@@ -25,7 +28,7 @@ const getCustomerGroups = async (req, res) => {
       data: groups,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -91,6 +94,12 @@ const deleteCustomerGroup = async (req, res) => {
     if (!group) {
       return res.status(404).json({ message: "Customer Group not found" });
     }
+
+    const hasCustomer = await Customer.exists({ companyId: group.companyId, customerGroupId: group._id });
+    if (hasCustomer) {
+      return res.status(400).json({ message: "Cannot delete this group — one or more Customers still belong to it." });
+    }
+
     await group.deleteOne();
     res.status(200).json({ message: "Customer Group deleted successfully" });
   } catch (error) {

@@ -1,5 +1,6 @@
 const Customer = require("../models/Customer");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getCustomers = async (req, res) => {
   try {
@@ -11,23 +12,24 @@ const getCustomers = async (req, res) => {
     const query = { companyId };
     if (search) {
       query.$or = [
-        { name: { $regex: search, $options: "i" } },
-        { phone: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } },
-        { city: { $regex: search, $options: "i" } }
+        { name: searchRegex(search) },
+        { phone: searchRegex(search) },
+        { email: searchRegex(search) },
+        { city: searchRegex(search) }
       ];
     }
     if (customerType) {
       query.customerType = customerType;
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [customers, total] = await Promise.all([
       Customer.find(query)
         .populate("customerGroupId", "name")
-        .sort({ createdAt: -1 }).lean()
+        .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parsedLimit).lean(),
       Customer.countDocuments(query)
@@ -37,7 +39,7 @@ const getCustomers = async (req, res) => {
       data: customers,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }

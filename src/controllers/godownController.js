@@ -1,5 +1,12 @@
 const Godown = require("../models/Godown");
+const Item = require("../models/Item");
+const Purchase = require("../models/Purchase");
+const Sale = require("../models/Sale");
+const PurchaseReturn = require("../models/PurchaseReturn");
+const SaleReturn = require("../models/SaleReturn");
+const StockTransfer = require("../models/StockTransfer");
 const { sendError } = require("../utils/errorHandler");
+const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
 const getGodowns = async (req, res) => {
   try {
@@ -10,11 +17,12 @@ const getGodowns = async (req, res) => {
 
     const query = { companyId };
     if (search) {
-      query.name = { $regex: search, $options: "i" };
+      query.name = searchRegex(search);
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const parsedLimit = parseInt(limit);
+    const parsedPage = clampPage(page);
+    const parsedLimit = clampLimit(limit);
+    const skip = (parsedPage - 1) * parsedLimit;
 
     const [godowns, total] = await Promise.all([
       Godown.find(query)
@@ -30,7 +38,7 @@ const getGodowns = async (req, res) => {
       data: godowns,
       pagination: {
         total,
-        page: parseInt(page),
+        page: parsedPage,
         limit: parsedLimit,
         totalPages: Math.ceil(total / parsedLimit)
       }
@@ -47,9 +55,9 @@ const createGodown = async (req, res) => {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
-    const exists = await Godown.findOne({ companyId, name });
+    const exists = await Godown.findOne({ companyId, name, godownGroupId: godownGroupId || null });
     if (exists) {
-      return res.status(400).json({ message: "Godown already exists in this company" });
+      return res.status(400).json({ message: "A godown with this name already exists in this Group" });
     }
 
     const godown = await Godown.create({
@@ -74,13 +82,23 @@ const updateGodown = async (req, res) => {
       return res.status(404).json({ message: "Godown not found" });
     }
 
-    if (name) {
-      const exists = await Godown.findOne({ companyId: godown.companyId, name: name.trim(), _id: { $ne: req.params.id } });
+    // Name + Group together identify a unique godown (same rule as createGodown/the
+    // compound index) — runs whenever either field is present, using the EFFECTIVE
+    // post-update value for whichever one isn't being changed right now.
+    if (name !== undefined || godownGroupId !== undefined) {
+      const effectiveName = name !== undefined ? name.trim() : godown.name;
+      const effectiveGroupId = godownGroupId !== undefined ? (godownGroupId || null) : (godown.godownGroupId || null);
+      const exists = await Godown.findOne({
+        companyId: godown.companyId,
+        name: effectiveName,
+        godownGroupId: effectiveGroupId,
+        _id: { $ne: req.params.id },
+      });
       if (exists) {
-        return res.status(400).json({ message: "Another Godown already exists with this name" });
+        return res.status(400).json({ message: "A godown with this name already exists in this Group" });
       }
-      godown.name = name.trim();
     }
+    if (name !== undefined) godown.name = name.trim();
     if (godownGroupId !== undefined) godown.godownGroupId = godownGroupId || null;
     if (isActive !== undefined) godown.isActive = isActive;
 
@@ -97,6 +115,29 @@ const deleteGodown = async (req, res) => {
     if (!godown) {
       return res.status(404).json({ message: "Godown not found" });
     }
+
+    // Every Purchase/Sale/PurchaseReturn/SaleReturn line's godownId (required) and
+    // every StockTransfer's fromGodownId/toGodownId reference Godown; so does every
+    // Item.mrpEntries[].godownStock[].godownId. Hard-deleting a Godown with live
+    // stock/transaction history strands that stock permanently and orphans every
+    // historical row's Godown reference.
+    const [hasPurchase, hasSale, hasPurchaseReturn, hasSaleReturn, hasTransfer, hasItemStock] = await Promise.all([
+      Purchase.exists({ companyId: godown.companyId, "items.godownId": godown._id }),
+      Sale.exists({ companyId: godown.companyId, "items.godownId": godown._id }),
+      PurchaseReturn.exists({ companyId: godown.companyId, "items.godownId": godown._id }),
+      SaleReturn.exists({ companyId: godown.companyId, "items.godownId": godown._id }),
+      StockTransfer.exists({
+        companyId: godown.companyId,
+        $or: [{ fromGodownId: godown._id }, { toGodownId: godown._id }],
+      }),
+      Item.exists({ companyId: godown.companyId, "mrpEntries.godownStock.godownId": godown._id }),
+    ]);
+    if (hasPurchase || hasSale || hasPurchaseReturn || hasSaleReturn || hasTransfer || hasItemStock) {
+      return res.status(400).json({
+        message: "Cannot delete this godown — it has Purchase, Sale, Return, Stock Transfer, or stock history. Deactivate it instead.",
+      });
+    }
+
     await godown.deleteOne();
     res.status(200).json({ message: "Godown deleted successfully" });
   } catch (error) {

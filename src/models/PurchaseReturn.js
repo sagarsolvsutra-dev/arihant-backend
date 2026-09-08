@@ -13,6 +13,13 @@ const PurchaseReturnItemSchema = new mongoose.Schema(
     packing: { type: Number, default: 1 },
     purchaseQty: { type: Number, default: 1 },
     mrp: { type: Number, default: 0 },
+    // Per-line, not per-invoice — a single return can send different items back
+    // out of different godowns. Was header-level until an explicit request to split it.
+    godownId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Godown",
+      required: true,
+    },
     caseQty: { type: Number, default: 0 },
     pcsQty: { type: Number, default: 0 },
     freeQty: { type: Number, default: 0 },
@@ -28,10 +35,12 @@ const PurchaseReturnItemSchema = new mongoose.Schema(
     gstPercent: { type: Number, default: 0 },
     gstAmount: { type: Number, default: 0 },
     netValue: { type: Number, default: 0 },
-    // Which stock bucket this line is being returned from — Fresh (resellable) or
-    // Damaged. Determines which bucket applyStockDelta decrements. See
-    // purchaseReturnController.assertSufficientStock/applyStockDelta.
-    condition: { type: String, enum: ["Fresh", "Damaged"], default: "Fresh" },
+    // Informational only — a reason recorded on the line for your own records
+    // (Fresh / Expired / Damaged). Does NOT change which bucket is checked/decremented
+    // (always Fresh) — see purchaseReturnController.assertSufficientStock/applyStockDelta
+    // for why: the physical stock being sent back to the supplier is always sitting in
+    // the Fresh bucket, regardless of why it's being returned.
+    condition: { type: String, enum: ["Fresh", "Expired", "Damaged"], default: "Fresh" },
   },
   { _id: false }
 );
@@ -45,11 +54,6 @@ const PurchaseReturnSchema = new mongoose.Schema(
     },
     returnNo: { type: String, required: true, trim: true },
     returnDate: { type: Date, required: true },
-    godownId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Godown",
-      required: true,
-    },
     // Unlike Purchase (where Supplier is a UI-only filter, never persisted), a Return
     // is fundamentally supplier-linked — stored here for real.
     supplierId: {
