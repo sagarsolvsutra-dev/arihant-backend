@@ -169,13 +169,18 @@ async function applyStockDelta(lines, fromGodownId, toGodownId, sign, companyId)
 
 const getStockTransfers = async (req, res) => {
   try {
-    const { companyId, page = 1, limit = 10, search = "" } = req.query;
+    const { companyId, page = 1, limit = 10, search = "", dateFrom, dateTo } = req.query;
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
 
     const query = { companyId };
     if (search) query.transferNo = searchRegex(search);
+    if (dateFrom || dateTo) {
+      query.transferDate = {};
+      if (dateFrom) query.transferDate.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (dateTo) query.transferDate.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+    }
 
     const parsedPage = clampPage(page);
     const parsedLimit = clampLimit(limit);
@@ -206,7 +211,7 @@ const getStockTransfers = async (req, res) => {
 
 const getStockTransferById = async (req, res) => {
   try {
-    const transfer = await StockTransfer.findById(req.params.id);
+    const transfer = await StockTransfer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!transfer) {
       return res.status(404).json({ message: "Stock transfer not found" });
     }
@@ -265,7 +270,7 @@ const createStockTransfer = async (req, res) => {
 
 const updateStockTransfer = async (req, res) => {
   try {
-    const transfer = await StockTransfer.findById(req.params.id);
+    const transfer = await StockTransfer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!transfer) {
       return res.status(404).json({ message: "Stock transfer not found" });
     }
@@ -298,7 +303,10 @@ const updateStockTransfer = async (req, res) => {
 
     // Reverse this transfer's OLD effect first (give stock back to the old FROM,
     // take it back out of the old TO) — same reverse-then-try-new-then-rollback
-    // pattern as Sale/the Return controllers.
+    // pattern as Sale/the Return controllers. The old TO godown's stock may have
+    // already moved on via a downstream Sale/transfer since this was created, so
+    // check it has enough before reversing (mirrors deleteStockTransfer's own guard).
+    await assertSufficientStock(oldItems, oldToGodownId, companyId);
     await applyStockDelta(oldItems, oldFromGodownId, oldToGodownId, -1, companyId);
 
     try {
@@ -332,7 +340,7 @@ const updateStockTransfer = async (req, res) => {
 
 const deleteStockTransfer = async (req, res) => {
   try {
-    const transfer = await StockTransfer.findById(req.params.id);
+    const transfer = await StockTransfer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!transfer) {
       return res.status(404).json({ message: "Stock transfer not found" });
     }

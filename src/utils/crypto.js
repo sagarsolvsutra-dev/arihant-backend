@@ -1,23 +1,21 @@
-const CryptoJS = require("crypto-js");
+const bcrypt = require("bcryptjs");
 
-const SECRET_KEY = process.env.JWT_SECRET || "arihant-erp-secret-key-2024";
+const SALT_ROUNDS = 10;
 
-const encryptPassword = (password) => {
-  if (!password) return "";
-  return CryptoJS.AES.encrypt(password.toString(), SECRET_KEY).toString();
+const hashPassword = async (password) => {
+  return bcrypt.hash(password.toString(), SALT_ROUNDS);
 };
 
-const decryptPassword = (encryptedPassword) => {
-  if (!encryptedPassword) return "";
+const comparePassword = async (password, hash) => {
+  if (!password || !hash) return false;
   try {
-    const bytes = CryptoJS.AES.decrypt(encryptedPassword, SECRET_KEY);
-    return bytes.toString(CryptoJS.enc.Utf8);
+    return await bcrypt.compare(password.toString(), hash);
   } catch (error) {
-    return "";
+    return false;
   }
 };
 
 module.exports = {
-  encryptPassword,
-  decryptPassword,
+  hashPassword,
+  comparePassword,
 };

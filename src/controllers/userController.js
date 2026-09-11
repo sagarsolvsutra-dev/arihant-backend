@@ -46,7 +46,8 @@ const getUsers = async (req, res) => {
     if (companyId) query.companyId = companyId;
     if (role) query.role = role;
 
-    const users = await User.find(query).lean()
+    const users = await User.find(query)
+      .select("-password")
       .populate("companyId", "name code")
       .sort({ createdAt: -1 }).lean();
 

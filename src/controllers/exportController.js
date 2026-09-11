@@ -1,6 +1,7 @@
 const PDFDocument = require("pdfkit");
 const ExcelJS = require("exceljs");
 const Godown = require("../models/Godown");
+const Item = require("../models/Item");
 const Purchase = require("../models/Purchase");
 const Sale = require("../models/Sale");
 const PurchaseReturn = require("../models/PurchaseReturn");
@@ -65,7 +66,7 @@ function fmtDate(d) {
 // means "every godown in this company". Godown is now per-LINE, not per-document
 // (a single invoice can span several godowns), so filtering happens per-line below
 // rather than as a Mongo-level document filter, and godownName is resolved per-line too.
-async function buildRows(type, companyId, godownId, godownNameMap) {
+async function buildRows(type, companyId, godownId, godownNameMap, itemSubGroupMap) {
   const config = TYPE_CONFIG[type];
   const isAllGodowns = !godownId || godownId === "all";
   let query = config.model.find({ companyId });
@@ -83,6 +84,7 @@ async function buildRows(type, companyId, godownId, godownNameMap) {
         godownName: isAllGodowns ? godownNameMap.get(String(line.godownId)) || "-" : undefined,
         party: partyName,
         itemName: line.itemName,
+        subGroupName: itemSubGroupMap.get(String(line.itemId)) || "-",
         caseQty: line.caseQty || 0,
         pcsQty: line.pcsQty || 0,
         // condition is now stored directly as one of the 3 real display values
@@ -104,6 +106,7 @@ function columnsFor(config, isAllGodowns) {
   if (isAllGodowns) cols.push({ key: "godownName", header: "Godown", width: 85 });
   if (config.partyLabel) cols.push({ key: "party", header: config.partyLabel, width: 95 });
   cols.push({ key: "itemName", header: "Item", width: 110 });
+  cols.push({ key: "subGroupName", header: "Sub Group", width: 90 });
   cols.push({ key: "caseQty", header: "Case", width: 45, align: "right" });
   cols.push({ key: "pcsQty", header: "Pcs", width: 45, align: "right" });
   if (config.hasCondition) cols.push({ key: "condition", header: "Condition", width: 65 });
@@ -227,16 +230,24 @@ const exportGodownTransactions = async (req, res) => {
       const allGodowns = await Godown.find({ companyId }).lean();
       godownNameMap = new Map(allGodowns.map((g) => [String(g._id), g.name]));
     } else {
-      const godown = await Godown.findById(godownId).lean();
+      const godown = await Godown.findOne({ _id: godownId, companyId }).lean();
       godownName = godown?.name || "Godown";
     }
+
+    // Same item name can legitimately repeat across different Sub Groups (see
+    // CLAUDE.md's Item model note) — every section's Item column gets a Sub
+    // Group column alongside it, same as every other item-line report/export.
+    const items = await Item.find({ companyId }).populate("itemSubGroupId", "name").select("itemSubGroupId").lean();
+    const itemSubGroupMap = new Map(
+      items.map((i) => [String(i._id), (typeof i.itemSubGroupId === "object" ? i.itemSubGroupId?.name : "") || "-"])
+    );
 
     // One {config, rows, columns} bundle per type — a single type in the normal
     // case, all four (in TYPE_CONFIG's declared order) for a combined export.
     const sections = await Promise.all(
       types.map(async (t) => {
         const config = TYPE_CONFIG[t];
-        const rows = await buildRows(t, companyId, godownId, godownNameMap);
+        const rows = await buildRows(t, companyId, godownId, godownNameMap, itemSubGroupMap);
         const columns = columnsFor(config, isAllGodowns);
         return { config, rows, columns };
       })

@@ -1,6 +1,47 @@
+const mongoose = require("mongoose");
 const Customer = require("../models/Customer");
+const Sale = require("../models/Sale");
+const SaleReturn = require("../models/SaleReturn");
+const OpeningBill = require("../models/OpeningBill");
+const Scheme = require("../models/Scheme");
 const { sendError } = require("../utils/errorHandler");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+
+// A customer with `creditDays` unset/0 has no configured due-date policy at
+// all, so "overdue" has no meaning for them — never flagged, matching the
+// same "empty means no limit" rule the credit-limit check uses. For everyone
+// else, a Sale counts against them once it's still unpaid past its own
+// `dueDate`, or past `invoiceDate + creditDays` when no explicit due date was
+// set on that particular invoice.
+async function computeOverdueFlags(companyId, customers) {
+  const withDays = customers.filter((c) => (c.creditDays || 0) > 0);
+  if (!withDays.length) return new Map();
+
+  const ids = withDays.map((c) => c._id);
+  const sales = await Sale.find({
+    companyId,
+    customerId: { $in: ids },
+    pendingAmount: { $gt: 0 },
+  })
+    .select("customerId invoiceDate dueDate")
+    .lean();
+
+  const creditDaysById = new Map(withDays.map((c) => [String(c._id), c.creditDays || 0]));
+  const now = new Date();
+  const overdue = new Map();
+  sales.forEach((s) => {
+    const id = String(s.customerId);
+    if (overdue.get(id)) return;
+    let effectiveDue = s.dueDate ? new Date(s.dueDate) : null;
+    if (!effectiveDue) {
+      const days = creditDaysById.get(id) || 0;
+      effectiveDue = new Date(s.invoiceDate);
+      effectiveDue.setDate(effectiveDue.getDate() + days);
+    }
+    if (effectiveDue < now) overdue.set(id, true);
+  });
+  return overdue;
+}
 
 const getCustomers = async (req, res) => {
   try {
@@ -35,8 +76,11 @@ const getCustomers = async (req, res) => {
       Customer.countDocuments(query)
     ]);
 
+    const overdueMap = await computeOverdueFlags(companyId, customers);
+    const data = customers.map((c) => ({ ...c, isOverdue: overdueMap.get(String(c._id)) || false }));
+
     res.status(200).json({
-      data: customers,
+      data,
       pagination: {
         total,
         page: parsedPage,
@@ -49,9 +93,36 @@ const getCustomers = async (req, res) => {
   }
 };
 
+// GET /api/customers/:id/outstanding?companyId=
+// Powers the credit-limit warning on Sale add/edit — total unpaid (pendingAmount)
+// across every Sale for this customer, plus their configured limit/days so the
+// frontend can decide whether to warn at all (0/unset = no limit configured).
+const getCustomerOutstanding = async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+
+    const customer = await Customer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId }).lean();
+    if (!customer) return res.status(404).json({ message: "Customer not found" });
+
+    const rows = await Sale.aggregate([
+      { $match: { companyId: new mongoose.Types.ObjectId(String(customer.companyId)), customerId: customer._id } },
+      { $group: { _id: null, total: { $sum: "$pendingAmount" } } },
+    ]);
+
+    res.status(200).json({
+      outstanding: rows[0]?.total || 0,
+      creditLimit: customer.creditLimit || 0,
+      creditDays: customer.creditDays || 0,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
 const getCustomerById = async (req, res) => {
   try {
-    const customer = await Customer.findById(req.params.id).populate("customerGroupId", "name");
+    const customer = await Customer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId }).populate("customerGroupId", "name");
     if (!customer) {
       return res.status(404).json({ message: "Customer not found" });
     }
@@ -112,7 +183,7 @@ const createCustomer = async (req, res) => {
 
 const updateCustomer = async (req, res) => {
   try {
-    const customer = await Customer.findById(req.params.id);
+    const customer = await Customer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!customer) {
       return res.status(404).json({ message: "Customer not found" });
     }
@@ -162,10 +233,26 @@ const updateCustomer = async (req, res) => {
 
 const deleteCustomer = async (req, res) => {
   try {
-    const customer = await Customer.findById(req.params.id);
+    const customer = await Customer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!customer) {
       return res.status(404).json({ message: "Customer not found" });
     }
+
+    // Sale.customerId, SaleReturn.customerId, and OpeningBill.customerId (type=sale)
+    // all reference Customer, as does Scheme.customerId. Hard-deleting a still-
+    // referenced Customer leaves each of those with a dangling ref.
+    const [hasSale, hasSaleReturn, hasOpeningBill, hasScheme] = await Promise.all([
+      Sale.exists({ companyId: customer.companyId, customerId: customer._id }),
+      SaleReturn.exists({ companyId: customer.companyId, customerId: customer._id }),
+      OpeningBill.exists({ companyId: customer.companyId, customerId: customer._id }),
+      Scheme.exists({ companyId: customer.companyId, customerId: customer._id }),
+    ]);
+    if (hasSale || hasSaleReturn || hasOpeningBill || hasScheme) {
+      return res.status(400).json({
+        message: "Cannot delete this customer — it is still referenced by Sales, Sale Returns, Opening Bills, or Schemes. Deactivate it instead.",
+      });
+    }
+
     await customer.deleteOne();
     res.status(200).json({ message: "Customer deleted successfully" });
   } catch (error) {
@@ -176,6 +263,7 @@ const deleteCustomer = async (req, res) => {
 module.exports = {
   getCustomers,
   getCustomerById,
+  getCustomerOutstanding,
   createCustomer,
   updateCustomer,
   deleteCustomer,

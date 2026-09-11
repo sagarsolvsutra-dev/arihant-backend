@@ -65,7 +65,7 @@ const createCustomerGroup = async (req, res) => {
 const updateCustomerGroup = async (req, res) => {
   try {
     const { name, zoneNo } = req.body;
-    const group = await CustomerGroup.findById(req.params.id);
+    const group = await CustomerGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
 
     if (!group) {
       return res.status(404).json({ message: "Customer Group not found" });
@@ -90,7 +90,7 @@ const updateCustomerGroup = async (req, res) => {
 
 const deleteCustomerGroup = async (req, res) => {
   try {
-    const group = await CustomerGroup.findById(req.params.id);
+    const group = await CustomerGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!group) {
       return res.status(404).json({ message: "Customer Group not found" });
     }

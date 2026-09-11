@@ -254,13 +254,18 @@ async function assertSufficientStock(lines, companyId) {
 
 const getPurchases = async (req, res) => {
   try {
-    const { companyId, page = 1, limit = 10, search = "" } = req.query;
+    const { companyId, page = 1, limit = 10, search = "", dateFrom, dateTo } = req.query;
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
 
     const query = { companyId };
     if (search) query.invoiceNo = searchRegex(search);
+    if (dateFrom || dateTo) {
+      query.invoiceDate = {};
+      if (dateFrom) query.invoiceDate.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (dateTo) query.invoiceDate.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+    }
 
     const parsedPage = clampPage(page);
     const parsedLimit = clampLimit(limit);
@@ -291,7 +296,7 @@ const getPurchases = async (req, res) => {
 
 const getPurchaseById = async (req, res) => {
   try {
-    const purchase = await Purchase.findById(req.params.id);
+    const purchase = await Purchase.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!purchase) {
       return res.status(404).json({ message: "Purchase not found" });
     }
@@ -350,7 +355,7 @@ const createPurchase = async (req, res) => {
 
 const updatePurchase = async (req, res) => {
   try {
-    const purchase = await Purchase.findById(req.params.id);
+    const purchase = await Purchase.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!purchase) {
       return res.status(404).json({ message: "Purchase not found" });
     }
@@ -418,7 +423,7 @@ const updatePurchase = async (req, res) => {
 
 const deletePurchase = async (req, res) => {
   try {
-    const purchase = await Purchase.findById(req.params.id);
+    const purchase = await Purchase.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!purchase) {
       return res.status(404).json({ message: "Purchase not found" });
     }

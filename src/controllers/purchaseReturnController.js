@@ -264,13 +264,18 @@ async function applyStockDelta(lines, sign, companyId) {
 
 const getPurchaseReturns = async (req, res) => {
   try {
-    const { companyId, page = 1, limit = 10, search = "" } = req.query;
+    const { companyId, page = 1, limit = 10, search = "", dateFrom, dateTo } = req.query;
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
 
     const query = { companyId };
     if (search) query.returnNo = searchRegex(search);
+    if (dateFrom || dateTo) {
+      query.returnDate = {};
+      if (dateFrom) query.returnDate.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (dateTo) query.returnDate.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+    }
 
     const parsedPage = clampPage(page);
     const parsedLimit = clampLimit(limit);
@@ -302,7 +307,7 @@ const getPurchaseReturns = async (req, res) => {
 
 const getPurchaseReturnById = async (req, res) => {
   try {
-    const purchaseReturn = await PurchaseReturn.findById(req.params.id).populate("supplierId", "name");
+    const purchaseReturn = await PurchaseReturn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId }).populate("supplierId", "name");
     if (!purchaseReturn) {
       return res.status(404).json({ message: "Purchase Return not found" });
     }
@@ -398,7 +403,7 @@ const createPurchaseReturn = async (req, res) => {
 
 const updatePurchaseReturn = async (req, res) => {
   try {
-    const purchaseReturn = await PurchaseReturn.findById(req.params.id);
+    const purchaseReturn = await PurchaseReturn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!purchaseReturn) {
       return res.status(404).json({ message: "Purchase Return not found" });
     }
@@ -478,7 +483,7 @@ const updatePurchaseReturn = async (req, res) => {
 
 const deletePurchaseReturn = async (req, res) => {
   try {
-    const purchaseReturn = await PurchaseReturn.findById(req.params.id);
+    const purchaseReturn = await PurchaseReturn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!purchaseReturn) {
       return res.status(404).json({ message: "Purchase Return not found" });
     }

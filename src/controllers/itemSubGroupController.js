@@ -63,7 +63,7 @@ const createItemSubGroup = async (req, res) => {
 
 const updateItemSubGroup = async (req, res) => {
   try {
-    const subGroup = await ItemSubGroup.findById(req.params.id);
+    const subGroup = await ItemSubGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!subGroup) {
       return res.status(404).json({ message: "Item Sub Group not found" });
     }
@@ -98,7 +98,7 @@ const updateItemSubGroup = async (req, res) => {
 
 const deleteItemSubGroup = async (req, res) => {
   try {
-    const subGroup = await ItemSubGroup.findById(req.params.id);
+    const subGroup = await ItemSubGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!subGroup) {
       return res.status(404).json({ message: "Item Sub Group not found" });
     }

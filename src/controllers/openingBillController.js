@@ -66,7 +66,7 @@ const createOpeningBill = async (req, res) => {
 
 const updateOpeningBill = async (req, res) => {
   try {
-    const bill = await OpeningBill.findById(req.params.id);
+    const bill = await OpeningBill.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!bill) {
       return res.status(404).json({ message: "Opening Bill not found" });
     }
@@ -104,7 +104,7 @@ const updateOpeningBill = async (req, res) => {
 
 const deleteOpeningBill = async (req, res) => {
   try {
-    const bill = await OpeningBill.findById(req.params.id);
+    const bill = await OpeningBill.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!bill) {
       return res.status(404).json({ message: "Opening Bill not found" });
     }

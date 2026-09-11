@@ -73,7 +73,7 @@ const createSalesman = async (req, res) => {
 
 const updateSalesman = async (req, res) => {
   try {
-    const salesman = await Salesman.findById(req.params.id);
+    const salesman = await Salesman.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!salesman) {
       return res.status(404).json({ message: "Salesman not found" });
     }
@@ -103,7 +103,7 @@ const updateSalesman = async (req, res) => {
 
 const deleteSalesman = async (req, res) => {
   try {
-    const salesman = await Salesman.findById(req.params.id);
+    const salesman = await Salesman.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!salesman) {
       return res.status(404).json({ message: "Salesman not found" });
     }

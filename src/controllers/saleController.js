@@ -235,13 +235,18 @@ async function applyStockDelta(lines, sign, companyId) {
 
 const getSales = async (req, res) => {
   try {
-    const { companyId, page = 1, limit = 10, search = "" } = req.query;
+    const { companyId, page = 1, limit = 10, search = "", dateFrom, dateTo } = req.query;
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
 
     const query = { companyId };
     if (search) query.invoiceNo = searchRegex(search);
+    if (dateFrom || dateTo) {
+      query.invoiceDate = {};
+      if (dateFrom) query.invoiceDate.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (dateTo) query.invoiceDate.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+    }
 
     const parsedPage = clampPage(page);
     const parsedLimit = clampLimit(limit);
@@ -273,7 +278,7 @@ const getSales = async (req, res) => {
 
 const getSaleById = async (req, res) => {
   try {
-    const sale = await Sale.findById(req.params.id).populate("customerId", "name customerType");
+    const sale = await Sale.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId }).populate("customerId", "name customerType");
     if (!sale) {
       return res.status(404).json({ message: "Sale not found" });
     }
@@ -335,7 +340,7 @@ const createSale = async (req, res) => {
 
 const updateSale = async (req, res) => {
   try {
-    const sale = await Sale.findById(req.params.id);
+    const sale = await Sale.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!sale) {
       return res.status(404).json({ message: "Sale not found" });
     }
@@ -405,7 +410,7 @@ const updateSale = async (req, res) => {
 
 const deleteSale = async (req, res) => {
   try {
-    const sale = await Sale.findById(req.params.id);
+    const sale = await Sale.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!sale) {
       return res.status(404).json({ message: "Sale not found" });
     }

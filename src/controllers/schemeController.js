@@ -69,7 +69,7 @@ const createScheme = async (req, res) => {
 
 const updateScheme = async (req, res) => {
   try {
-    const scheme = await Scheme.findById(req.params.id);
+    const scheme = await Scheme.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!scheme) {
       return res.status(404).json({ message: "Scheme not found" });
     }
@@ -92,7 +92,7 @@ const updateScheme = async (req, res) => {
 
 const deleteScheme = async (req, res) => {
   try {
-    const scheme = await Scheme.findById(req.params.id);
+    const scheme = await Scheme.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!scheme) {
       return res.status(404).json({ message: "Scheme not found" });
     }

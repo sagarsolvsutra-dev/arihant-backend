@@ -70,7 +70,7 @@ const getItems = async (req, res) => {
 
 const getItemById = async (req, res) => {
   try {
-    const item = await Item.findById(req.params.id)
+    const item = await Item.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId })
       .populate("supplierId", "name")
       .populate("itemSubGroupId", "name");
     if (!item) {
@@ -234,7 +234,7 @@ const createItem = async (req, res) => {
 
 const updateItem = async (req, res) => {
   try {
-    const item = await Item.findById(req.params.id);
+    const item = await Item.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!item) {
       return res.status(404).json({ message: "Item not found" });
     }
@@ -364,7 +364,7 @@ const updateItem = async (req, res) => {
 
 const deleteItem = async (req, res) => {
   try {
-    const item = await Item.findById(req.params.id);
+    const item = await Item.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!item) {
       return res.status(404).json({ message: "Item not found" });
     }

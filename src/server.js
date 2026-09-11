@@ -8,9 +8,10 @@ dns.setServers(["8.8.8.8", "1.1.1.1"]);
 const connectDB = require("./config/db");
 const hsnRoutes = require("./routes/hsnRoutes");
 const authRoutes = require("./routes/authRoutes");
+const { protect, scopeCompany } = require("./middlewares/auth");
 const Company = require("./models/Company");
 const User = require("./models/User");
-const { encryptPassword } = require("./utils/crypto");
+const { hashPassword } = require("./utils/crypto");
 
 // Connect to Database
 connectDB().then(async () => {
@@ -28,7 +29,7 @@ connectDB().then(async () => {
     // Seed Super Admin if no super admin exists
     const superAdminCount = await User.countDocuments({ role: "super_admin" });
     if (superAdminCount === 0) {
-      const hashedPassword = encryptPassword("admin123");
+      const hashedPassword = await hashPassword("admin123");
       await User.create({
         name: "Super Admin",
         email: "superadmin@arihant.com",
@@ -71,31 +72,38 @@ if (process.env.NODE_ENV === "development") {
 }
 
 // Routes
+// authRoutes applies protect()/requireRole() per-route internally (login/
+// logout stay public — there's no token yet to check at login).
 app.use("/api/auth", authRoutes);
-app.use("/api/hsn", hsnRoutes);
-app.use("/api/companies", require("./routes/companyRoutes"));
-app.use("/api/users", require("./routes/userRoutes"));
+
+// Every other route requires a valid token; scopeCompany then forces
+// company_admin/staff onto their own companyId regardless of what the client
+// sent, and passes super_admin's explicit companyId through untouched.
+app.use("/api/companies", protect, scopeCompany, require("./routes/companyRoutes"));
+app.use("/api/users", protect, scopeCompany, require("./routes/userRoutes"));
 // Master Routes
-app.use("/api/item-names", require("./routes/itemNameRoutes"));
-app.use("/api/item-sub-groups", require("./routes/itemSubGroupRoutes"));
-app.use("/api/customer-groups", require("./routes/customerGroupRoutes"));
-app.use("/api/supplier-groups", require("./routes/supplierGroupRoutes"));
-app.use("/api/godown-groups", require("./routes/godownGroupRoutes"));
-app.use("/api/godowns", require("./routes/godownRoutes"));
-app.use("/api/hsn", require("./routes/hsnRoutes"));
+app.use("/api/item-names", protect, scopeCompany, require("./routes/itemNameRoutes"));
+app.use("/api/item-sub-groups", protect, scopeCompany, require("./routes/itemSubGroupRoutes"));
+app.use("/api/customer-groups", protect, scopeCompany, require("./routes/customerGroupRoutes"));
+app.use("/api/supplier-groups", protect, scopeCompany, require("./routes/supplierGroupRoutes"));
+app.use("/api/godown-groups", protect, scopeCompany, require("./routes/godownGroupRoutes"));
+app.use("/api/godowns", protect, scopeCompany, require("./routes/godownRoutes"));
+app.use("/api/hsn", protect, scopeCompany, hsnRoutes);
 
 // Data Routes
-app.use("/api/items", require("./routes/itemRoutes"));
-app.use("/api/customers", require("./routes/customerRoutes"));
-app.use("/api/suppliers", require("./routes/supplierRoutes"));
-app.use("/api/salesmen", require("./routes/salesmanRoutes"));
-app.use("/api/schemes", require("./routes/schemeRoutes"));
-app.use("/api/opening-bills", require("./routes/openingBillRoutes"));
-app.use("/api/purchases", require("./routes/purchaseRoutes"));
-app.use("/api/sales", require("./routes/saleRoutes"));
-app.use("/api/purchase-returns", require("./routes/purchaseReturnRoutes"));
-app.use("/api/sale-returns", require("./routes/saleReturnRoutes"));
-app.use("/api/stock-transfers", require("./routes/stockTransferRoutes"));
+app.use("/api/items", protect, scopeCompany, require("./routes/itemRoutes"));
+app.use("/api/customers", protect, scopeCompany, require("./routes/customerRoutes"));
+app.use("/api/suppliers", protect, scopeCompany, require("./routes/supplierRoutes"));
+app.use("/api/salesmen", protect, scopeCompany, require("./routes/salesmanRoutes"));
+app.use("/api/schemes", protect, scopeCompany, require("./routes/schemeRoutes"));
+app.use("/api/opening-bills", protect, scopeCompany, require("./routes/openingBillRoutes"));
+app.use("/api/purchases", protect, scopeCompany, require("./routes/purchaseRoutes"));
+app.use("/api/sales", protect, scopeCompany, require("./routes/saleRoutes"));
+app.use("/api/purchase-returns", protect, scopeCompany, require("./routes/purchaseReturnRoutes"));
+app.use("/api/sale-returns", protect, scopeCompany, require("./routes/saleReturnRoutes"));
+app.use("/api/stock-transfers", protect, scopeCompany, require("./routes/stockTransferRoutes"));
+app.use("/api/export-list", protect, scopeCompany, require("./routes/exportListRoutes"));
+app.use("/api/reports", protect, scopeCompany, require("./routes/reportRoutes"));
 
 // Health Check
 app.get("/health", (req, res) => {

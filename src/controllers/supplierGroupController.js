@@ -64,7 +64,7 @@ const createSupplierGroup = async (req, res) => {
 const updateSupplierGroup = async (req, res) => {
   try {
     const { name } = req.body;
-    const group = await SupplierGroup.findById(req.params.id);
+    const group = await SupplierGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
 
     if (!group) {
       return res.status(404).json({ message: "Supplier Group not found" });
@@ -87,7 +87,7 @@ const updateSupplierGroup = async (req, res) => {
 
 const deleteSupplierGroup = async (req, res) => {
   try {
-    const group = await SupplierGroup.findById(req.params.id);
+    const group = await SupplierGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!group) {
       return res.status(404).json({ message: "Supplier Group not found" });
     }

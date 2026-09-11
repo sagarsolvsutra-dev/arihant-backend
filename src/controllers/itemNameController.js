@@ -29,7 +29,12 @@ exports.createItemName = async (req, res) => {
 
 exports.getItemNames = async (req, res) => {
   try {
-    const { companyId } = req.params;
+    // This route takes companyId as a URL path param (:companyId), unlike
+    // every other list endpoint's ?companyId= query param — scopeCompany's
+    // req.query/req.body override doesn't reach it, so it's enforced directly
+    // here: a company_admin/staff can never pass a foreign companyId in the
+    // URL, only super_admin can request an explicit one.
+    const companyId = req.user.role === "super_admin" ? req.params.companyId : req.user.companyId;
     const { search, supplierId } = req.query;
 
     if (!companyId) {
@@ -60,7 +65,7 @@ exports.updateItemName = async (req, res) => {
     const { id } = req.params;
     const { name, supplierId, isActive } = req.body;
 
-    const itemName = await ItemName.findById(id);
+    const itemName = await ItemName.findOne({ _id: id, companyId: req.effectiveCompanyId });
     if (!itemName) {
       return res.status(404).json({ message: "Item Name not found" });
     }
@@ -99,7 +104,7 @@ exports.updateItemName = async (req, res) => {
 exports.deleteItemName = async (req, res) => {
   try {
     const { id } = req.params;
-    const itemName = await ItemName.findByIdAndDelete(id);
+    const itemName = await ItemName.findOneAndDelete({ _id: id, companyId: req.effectiveCompanyId });
     if (!itemName) {
       return res.status(404).json({ message: "Item Name not found" });
     }

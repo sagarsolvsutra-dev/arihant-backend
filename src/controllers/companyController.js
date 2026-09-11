@@ -1,7 +1,6 @@
-const bcrypt = require("bcryptjs");
 const Company = require("../models/Company");
 const User = require("../models/User");
-const { encryptPassword, decryptPassword } = require("../utils/crypto");
+const { hashPassword } = require("../utils/crypto");
 
 // @desc    Get single company by ID with admin details
 // @route   GET /api/companies/:id
@@ -142,7 +141,7 @@ const createCompany = async (req, res) => {
 
     let createdUser = null;
     if (adminData && adminData.name && adminData.email && adminData.password) {
-      const hashedPassword = encryptPassword(adminData.password);
+      const hashedPassword = await hashPassword(adminData.password);
       createdUser = await User.create({
         name: adminData.name.trim(),
         email: adminData.email.toLowerCase().trim(),
@@ -253,7 +252,7 @@ const updateCompany = async (req, res) => {
         if (adminUpdates.phone !== undefined)
           adminSet.phone = adminUpdates.phone || "";
         if (adminUpdates.password) {
-          adminSet.password = encryptPassword(adminUpdates.password);
+          adminSet.password = await hashPassword(adminUpdates.password);
         }
 
         updatedUser = await User.findByIdAndUpdate(existingAdmin._id, adminSet, {
@@ -272,7 +271,7 @@ const updateCompany = async (req, res) => {
           }
 
           const passwordToUse = adminUpdates.password || "admin123";
-          const hashedPassword = encryptPassword(passwordToUse);
+          const hashedPassword = await hashPassword(passwordToUse);
 
           updatedUser = await User.create({
             name: adminUpdates.name.trim(),

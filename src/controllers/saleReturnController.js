@@ -268,13 +268,18 @@ async function applyStockDelta(lines, sign, companyId) {
 
 const getSaleReturns = async (req, res) => {
   try {
-    const { companyId, page = 1, limit = 10, search = "" } = req.query;
+    const { companyId, page = 1, limit = 10, search = "", dateFrom, dateTo } = req.query;
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
 
     const query = { companyId };
     if (search) query.returnNo = searchRegex(search);
+    if (dateFrom || dateTo) {
+      query.returnDate = {};
+      if (dateFrom) query.returnDate.$gte = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (dateTo) query.returnDate.$lte = new Date(`${dateTo}T23:59:59.999Z`);
+    }
 
     const parsedPage = clampPage(page);
     const parsedLimit = clampLimit(limit);
@@ -306,7 +311,7 @@ const getSaleReturns = async (req, res) => {
 
 const getSaleReturnById = async (req, res) => {
   try {
-    const saleReturn = await SaleReturn.findById(req.params.id).populate("customerId", "name");
+    const saleReturn = await SaleReturn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId }).populate("customerId", "name");
     if (!saleReturn) {
       return res.status(404).json({ message: "Sale Return not found" });
     }
@@ -401,7 +406,7 @@ const createSaleReturn = async (req, res) => {
 
 const updateSaleReturn = async (req, res) => {
   try {
-    const saleReturn = await SaleReturn.findById(req.params.id);
+    const saleReturn = await SaleReturn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!saleReturn) {
       return res.status(404).json({ message: "Sale Return not found" });
     }
@@ -485,7 +490,7 @@ const updateSaleReturn = async (req, res) => {
 
 const deleteSaleReturn = async (req, res) => {
   try {
-    const saleReturn = await SaleReturn.findById(req.params.id);
+    const saleReturn = await SaleReturn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!saleReturn) {
       return res.status(404).json({ message: "Sale Return not found" });
     }

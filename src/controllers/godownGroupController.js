@@ -64,7 +64,7 @@ const createGodownGroup = async (req, res) => {
 const updateGodownGroup = async (req, res) => {
   try {
     const { name } = req.body;
-    const group = await GodownGroup.findById(req.params.id);
+    const group = await GodownGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
 
     if (!group) {
       return res.status(404).json({ message: "Godown Group not found" });
@@ -87,7 +87,7 @@ const updateGodownGroup = async (req, res) => {
 
 const deleteGodownGroup = async (req, res) => {
   try {
-    const group = await GodownGroup.findById(req.params.id);
+    const group = await GodownGroup.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!group) {
       return res.status(404).json({ message: "Godown Group not found" });
     }

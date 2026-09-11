@@ -1,19 +1,28 @@
-const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const Company = require("../models/Company");
-const { encryptPassword, decryptPassword } = require("../utils/crypto");
+const { hashPassword, comparePassword } = require("../utils/crypto");
 
 const JWT_SECRET = process.env.JWT_SECRET || "arihant-erp-secret-key-2024";
 
 // Generate JWT Token
+// user.companyId may be a plain ObjectId OR a populated Company subdocument
+// (login() populates it for the response) — .toString() on a populated
+// Mongoose document returns its debug-inspect output ("{ _id: ..., name:
+// ... }"), not the id, so this must unwrap ._id first when populated. This
+// was a real, previously-dormant bug: nothing ever read the JWT's companyId
+// field before real route auth existed, so a garbled value here was invisible
+// until scopeCompany started relying on it.
 const generateToken = (user) => {
+  const companyIdValue = user.companyId
+    ? (user.companyId._id || user.companyId).toString()
+    : null;
   return jwt.sign(
     {
       userId: user._id.toString(),
       email: user.email,
       role: user.role,
-      companyId: user.companyId ? user.companyId.toString() : null,
+      companyId: companyIdValue,
     },
     JWT_SECRET,
     { expiresIn: "24h" }
@@ -44,21 +53,9 @@ const login = async (req, res) => {
         .json({ success: false, message: "Invalid email or password" });
     }
 
-    // Compare password
-    let isMatch = false;
-    try {
-      const decrypted = decryptPassword(user.password);
-      if (decrypted) {
-        isMatch = decrypted === password;
-      }
-    } catch (e) {}
-
-    // Fallback to bcrypt
-    if (!isMatch) {
-      try {
-        isMatch = await bcrypt.compare(password, user.password);
-      } catch (e) {}
-    }
+    // Passwords are always bcrypt hashes now (migrated from the old reversible
+    // AES storage — see scripts/migrate-passwords-to-bcrypt.js).
+    const isMatch = await comparePassword(password, user.password);
 
     if (!isMatch) {
       return res
@@ -96,16 +93,10 @@ const login = async (req, res) => {
 // @route   GET /api/auth/me
 const me = async (req, res) => {
   try {
-    const token = req.headers.authorization?.replace("Bearer ", "");
-
-    if (!token) {
-      return res
-        .status(401)
-        .json({ success: false, message: "No token provided" });
-    }
-
-    const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await User.findById(decoded.userId).populate(
+    // req.user is set by the protect() middleware, which already verified the
+    // token — re-fetch the live User row here for fresh name/role/isActive
+    // (the JWT payload itself is a point-in-time snapshot from login).
+    const user = await User.findById(req.user.userId).populate(
       "companyId",
       "name code"
     );
@@ -146,8 +137,11 @@ const register = async (req, res) => {
       });
     }
 
-    // Validate role
-    const validRoles = ["super_admin", "company_admin", "staff"];
+    // This endpoint has no caller-identity check (see the project-wide no-auth
+    // issue), so it must never be allowed to mint a super_admin — that would be a
+    // one-request privilege escalation for anyone who can reach the API at all.
+    // super_admin accounts are only ever created by the initial server.js seed.
+    const validRoles = ["company_admin", "staff"];
     if (!validRoles.includes(role)) {
       return res.status(400).json({ success: false, message: "Invalid role" });
     }
@@ -160,8 +154,9 @@ const register = async (req, res) => {
         .json({ success: false, message: "Email already registered" });
     }
 
-    // Validate companyId for non-super-admin
-    if (role !== "super_admin" && !companyId) {
+    // companyId is required for both allowed roles now that super_admin can't
+    // self-register through this endpoint.
+    if (!companyId) {
       return res.status(400).json({
         success: false,
         message: "Company ID is required for company admin and staff",
@@ -178,8 +173,7 @@ const register = async (req, res) => {
       }
     }
 
-    // Encrypt password
-    const hashedPassword = encryptPassword(password);
+    const hashedPassword = await hashPassword(password);
 
     // Create user
     const user = await User.create({
@@ -220,21 +214,27 @@ const getUsers = async (req, res) => {
       query.companyId = companyId;
     }
 
-    const users = await User.find(query).lean()
+    // Passwords are one-way bcrypt hashes now — never returned, not even
+    // hashed (see the migration in scripts/migrate-passwords-to-bcrypt.js).
+    // This closes the plaintext-password leak this endpoint used to have.
+    const users = await User.find(query)
+      .select("-password")
       .populate("companyId", "name code")
       .sort({ createdAt: -1 }).lean();
 
-    const decryptedUsers = users.map((user) => {
-      const userObj = user;
-      userObj.password = decryptPassword(userObj.password);
-      return userObj;
-    });
-
-    res.json({ success: true, users: decryptedUsers });
+    res.json({ success: true, users });
   } catch (error) {
     console.error("Get users error:", error);
     res.status(500).json({ success: false, message: "Server error" });
   }
 };
 
-module.exports = { login, me, register, getUsers };
+// @desc    Logout — JWTs are stateless here (no server-side session/blacklist),
+//          so this is a no-op that exists only so the frontend's best-effort
+//          logout call gets a real 200 instead of a 404 on every logout.
+// @route   POST /api/auth/logout
+const logout = async (req, res) => {
+  res.status(200).json({ success: true, message: "Logged out" });
+};
+
+module.exports = { login, me, register, getUsers, logout };

@@ -5,12 +5,14 @@ router.param("id", validateObjectIdParam);
 const {
   getCustomers,
   getCustomerById,
+  getCustomerOutstanding,
   createCustomer,
   updateCustomer,
   deleteCustomer,
 } = require("../controllers/customerController");
 
 router.route("/").get(getCustomers).post(createCustomer);
+router.get("/:id/outstanding", getCustomerOutstanding);
 router.route("/:id").get(getCustomerById).put(updateCustomer).delete(deleteCustomer);
 
 module.exports = router;

@@ -1,4 +1,5 @@
 const Hsn = require("../models/Hsn");
+const Item = require("../models/Item");
 const { sendError } = require("../utils/errorHandler");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 
@@ -86,7 +87,7 @@ const createHsnCode = async (req, res) => {
 const updateHsnCode = async (req, res) => {
   try {
     const { description, uqcUnit } = req.body;
-    const hsn = await Hsn.findById(req.params.id);
+    const hsn = await Hsn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
 
     if (!hsn) {
       return res.status(404).json({ message: "HSN Code not found" });
@@ -116,10 +117,19 @@ const updateHsnCode = async (req, res) => {
 // @access  Public
 const deleteHsnCode = async (req, res) => {
   try {
-    const hsn = await Hsn.findById(req.params.id);
+    const hsn = await Hsn.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
 
     if (!hsn) {
       return res.status(404).json({ message: "HSN Code not found" });
+    }
+
+    // Item.hsnCode is a plain string (the code itself), not an ObjectId ref to
+    // this model — matched by value, not by _id.
+    const hasItem = await Item.exists({ companyId: hsn.companyId, hsnCode: hsn.hsnCode });
+    if (hasItem) {
+      return res.status(400).json({
+        message: "Cannot delete this HSN code — it is still referenced by one or more Items. Change those Items' HSN Code first.",
+      });
     }
 
     await hsn.deleteOne();

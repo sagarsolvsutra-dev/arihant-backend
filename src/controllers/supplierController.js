@@ -52,7 +52,7 @@ const getSuppliers = async (req, res) => {
 
 const getSupplierById = async (req, res) => {
   try {
-    const supplier = await Supplier.findById(req.params.id).populate("supplierGroupId", "name");
+    const supplier = await Supplier.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId }).populate("supplierGroupId", "name");
     if (!supplier) {
       return res.status(404).json({ message: "Supplier not found" });
     }
@@ -107,7 +107,7 @@ const createSupplier = async (req, res) => {
 
 const updateSupplier = async (req, res) => {
   try {
-    const supplier = await Supplier.findById(req.params.id);
+    const supplier = await Supplier.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!supplier) {
       return res.status(404).json({ message: "Supplier not found" });
     }
@@ -151,7 +151,7 @@ const updateSupplier = async (req, res) => {
 
 const deleteSupplier = async (req, res) => {
   try {
-    const supplier = await Supplier.findById(req.params.id);
+    const supplier = await Supplier.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
     if (!supplier) {
       return res.status(404).json({ message: "Supplier not found" });
     }
