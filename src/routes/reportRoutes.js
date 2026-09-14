@@ -8,6 +8,7 @@ const {
   getSaleReport,
   getPurchaseReturnReport,
   getSaleReturnReport,
+  getFullStockReport,
   getCustomerLedger,
   getSupplierLedger,
   exportItemReport,
@@ -17,6 +18,7 @@ const {
   exportSaleReport,
   exportPurchaseReturnReport,
   exportSaleReturnReport,
+  exportFullStockReport,
   exportCustomerLedger,
   exportSupplierLedger,
 } = require("../controllers/reportController");
@@ -40,6 +42,8 @@ router.get("/purchase-returns/export", exportPurchaseReturnReport);
 router.get("/purchase-returns", getPurchaseReturnReport);
 router.get("/sale-returns/export", exportSaleReturnReport);
 router.get("/sale-returns", getSaleReturnReport);
+router.get("/full-stock/export", exportFullStockReport);
+router.get("/full-stock", getFullStockReport);
 
 router.param("customerId", validateObjectIdParam);
 router.param("supplierId", validateObjectIdParam);

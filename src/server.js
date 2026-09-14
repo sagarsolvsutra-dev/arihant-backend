@@ -63,6 +63,12 @@ app.use(cors({
     process.env.FRONTEND_URL
   ].filter(Boolean),
   credentials: true,
+  // The frontend's Excel/PDF exports now fetch()+blob() instead of
+  // window.open()'ing the file URL directly (see lib/download.ts) — that
+  // requires reading the filename back out of Content-Disposition via
+  // `response.headers.get()`, which the browser hides on cross-origin
+  // responses unless it's explicitly exposed here.
+  exposedHeaders: ["Content-Disposition"],
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));

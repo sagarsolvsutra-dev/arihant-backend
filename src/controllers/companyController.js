@@ -54,6 +54,15 @@ const getCompanies = async (req, res) => {
 
     const companiesWithCount = companies.map((c) => ({
       ...c,
+      // `.lean()` returns exactly what's stored in Mongo — it skips Mongoose's
+      // usual default-applying hydration, so a handful of pre-existing
+      // companies saved before `isActive` existed on the schema come back
+      // with the field simply absent (not `false`). `undefined` is falsy in
+      // JS/JSX, so the frontend's `c.isActive ? "Active" : "Inactive"` badge
+      // rendered those as Inactive even though they're real, in-use
+      // companies. Normalize here rather than trusting the schema default to
+      // apply on a lean read.
+      isActive: c.isActive !== false,
       adminCount: countMap[c._id.toString()] || 0,
     }));
 
@@ -228,9 +237,20 @@ const updateCompany = async (req, res) => {
     let updatedUser = null;
     if (req.body.admin) {
       const adminUpdates = req.body.admin;
+      // Only an ACTIVE admin counts as "the existing admin" here — a
+      // deactivated one (removed via the frontend's "Remove Admin" action,
+      // which soft-deactivates rather than hard-deletes) must NOT be matched
+      // and silently edited in place. Without this, filling in fresh admin
+      // details after a removal would just update the deactivated row's
+      // fields (name/email/etc.) without ever setting isActive back to true,
+      // leaving the company still showing "No admin" despite the save
+      // appearing to succeed. Excluding inactive rows here means a removed
+      // admin's slot is correctly treated as empty, so the `else` branch
+      // below creates a genuinely new, active admin instead.
       const existingAdmin = await User.findOne({
         companyId: id,
         role: "company_admin",
+        isActive: true,
       });
 
       if (existingAdmin) {
@@ -259,29 +279,55 @@ const updateCompany = async (req, res) => {
           new: true,
         });
       } else {
-        // If no admin exists for this company, create a new admin
+        // If no ACTIVE admin exists for this company, either create a new
+        // admin, or — if the submitted email belongs to an existing but
+        // INACTIVE user (e.g. one just removed via the frontend's "Remove
+        // Admin" action, which soft-deactivates rather than hard-deletes) —
+        // reactivate that same account for this company instead of
+        // rejecting it as a duplicate. Without this, an email could never
+        // be reused for a company_admin once removed, even to restore the
+        // exact same person moments later: confirmed live, removing
+        // "sagar" and then re-submitting sagar@gmail.com as the new admin
+        // failed with "Admin email sagar@gmail.com already exists." even
+        // though the only "existing" row was the just-deactivated one.
         if (adminUpdates.email && adminUpdates.name) {
           const newEmail = adminUpdates.email.toLowerCase().trim();
           const emailExists = await User.findOne({ email: newEmail });
-          if (emailExists) {
+
+          if (emailExists && emailExists.isActive) {
             return res.status(400).json({
               success: false,
               message: `Admin email ${newEmail} already exists.`,
             });
           }
 
-          const passwordToUse = adminUpdates.password || "admin123";
-          const hashedPassword = await hashPassword(passwordToUse);
+          if (emailExists) {
+            // Reactivate rather than duplicate. Password/phone only change
+            // if actually provided, matching the "leave blank to keep
+            // current" convention used when editing an already-active admin.
+            const reactivateSet = {
+              name: adminUpdates.name.trim(),
+              role: "company_admin",
+              companyId: id,
+              isActive: true,
+            };
+            if (adminUpdates.phone !== undefined) reactivateSet.phone = adminUpdates.phone || "";
+            if (adminUpdates.password) reactivateSet.password = await hashPassword(adminUpdates.password);
+            updatedUser = await User.findByIdAndUpdate(emailExists._id, reactivateSet, { new: true });
+          } else {
+            const passwordToUse = adminUpdates.password || "admin123";
+            const hashedPassword = await hashPassword(passwordToUse);
 
-          updatedUser = await User.create({
-            name: adminUpdates.name.trim(),
-            email: newEmail,
-            phone: adminUpdates.phone || "",
-            password: hashedPassword,
-            role: "company_admin",
-            companyId: id,
-            isActive: true,
-          });
+            updatedUser = await User.create({
+              name: adminUpdates.name.trim(),
+              email: newEmail,
+              phone: adminUpdates.phone || "",
+              password: hashedPassword,
+              role: "company_admin",
+              companyId: id,
+              isActive: true,
+            });
+          }
         }
       }
     }

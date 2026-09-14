@@ -720,6 +720,242 @@ const getSupplierLedger = async (req, res) => {
   }
 };
 
+// Splits a (possibly negative) total-pieces figure into whole Case + a
+// remainder of loose Pcs via truncation-toward-zero, NOT `lib/stock.ts`'s own
+// `Math.floor`-based `splitCasePcs` — this deliberately reproduces the exact
+// behavior of the legacy "Full Report" stock-summary export the user supplied
+// as a reference (a genuinely negative closing figure, e.g. a company that
+// oversold before this system's own oversell-guards existed, showed as Case 0
+// / Pcs -1 in that file, not Case -1 / Pcs 19 the way Math.floor would split
+// it) — confirmed by re-deriving that file's own numbers from its column
+// values before writing this.
+function splitCasePcsTrunc(totalPcs, packing) {
+  const p = packing || 1;
+  const caseQty = Math.trunc(totalPcs / p);
+  return { caseQty, pcs: totalPcs - caseQty * p };
+}
+
+const FULL_STOCK_ROW_CAP = 5000;
+
+// GET/export shared builder for the "Full Report" — a comprehensive per-item
+// stock movement report grouped by Supplier (the "group" concept; ItemGroup
+// itself no longer exists, Supplier absorbed that role, see CLAUDE.md), with
+// a subtotal row per group and one grand-total row. Modeled directly on a
+// legacy stock-summary export the user supplied as a reference: its own
+// column layout is group/itcod/hsncode/item/unit/weight/packing/opening/
+// purchase/sale/closing, with opening/purchase/sale/closing EACH also split
+// into its own case+pcs pair, plus mrp_rate/rate/value.
+//
+// Not paginated — every matching item is loaded in one response (capped),
+// the same design as the Customer/Supplier Ledgers, because group and grand
+// totals need the full filtered set, not just one page.
+//
+// "Opening" is computed as of dateFrom — not just the item's flat entered
+// opening stock — by adding every purchase/sale/return dated BEFORE dateFrom
+// (mirrors `buildLedger`'s own openingBalance-before-range accumulation). With
+// no dateFrom, Opening is simply the flat entered value and Purchase/Sale
+// below cover all-time.
+//
+// Purchase and Sale are each netted against their own Return type within the
+// range (Purchase − PurchaseReturn, Sale − SaleReturn) specifically so
+// Closing = Opening + Purchase − Sale holds exactly — verified against the
+// reference file's own GROUP TOTAL/GRAND TOTAL rows, which have no separate
+// Return columns at all (that legacy software either never used returns or
+// netted them directly) — while still correctly accounting for this app's
+// real, separate Purchase Return / Sale Return modules.
+async function buildFullStockReport(query, { cap = FULL_STOCK_ROW_CAP } = {}) {
+  const { companyId, dateFrom, dateTo, supplierId, search = "" } = query;
+
+  const itemQuery = { companyId };
+  if (supplierId && isValidObjectId(supplierId)) itemQuery.supplierId = oid(supplierId);
+  if (search && search.trim()) itemQuery.itemName = searchRegex(search.trim());
+
+  const items = await Item.find(itemQuery).populate("supplierId", "name").sort({ itemName: 1 }).limit(cap).lean();
+  const itemIds = items.map((i) => i._id);
+
+  async function sumPiecesByItem(Model, dateFilter) {
+    if (!itemIds.length || !dateFilter) return new Map();
+    const rows = await Model.aggregate([
+      { $match: { companyId: oid(companyId), ...dateFilter } },
+      { $unwind: "$items" },
+      { $match: { "items.itemId": { $in: itemIds } } },
+      { $group: { _id: "$items.itemId", pcs: { $sum: "$items.totalPieces" } } },
+    ]);
+    return new Map(rows.map((r) => [String(r._id), r.pcs]));
+  }
+
+  const beforeDate = dateFrom ? new Date(`${dateFrom}T00:00:00.000Z`) : null;
+  const before = (field) => (beforeDate ? { [field]: { $lt: beforeDate } } : null);
+
+  const [purchaseBeforeMap, saleBeforeMap, pReturnBeforeMap, sReturnBeforeMap, purchaseInMap, saleInMap, pReturnInMap, sReturnInMap] =
+    await Promise.all([
+      sumPiecesByItem(Purchase, before("invoiceDate")),
+      sumPiecesByItem(Sale, before("invoiceDate")),
+      sumPiecesByItem(PurchaseReturn, before("returnDate")),
+      sumPiecesByItem(SaleReturn, before("returnDate")),
+      sumPiecesByItem(Purchase, dateRangeFilter("invoiceDate", dateFrom, dateTo)),
+      sumPiecesByItem(Sale, dateRangeFilter("invoiceDate", dateFrom, dateTo)),
+      sumPiecesByItem(PurchaseReturn, dateRangeFilter("returnDate", dateFrom, dateTo)),
+      sumPiecesByItem(SaleReturn, dateRangeFilter("returnDate", dateFrom, dateTo)),
+    ]);
+
+  const rowsRaw = items.map((item) => {
+    const id = String(item._id);
+    const openingPcs =
+      (item.openingStockFreshPcs || 0) +
+      (purchaseBeforeMap.get(id) || 0) -
+      (saleBeforeMap.get(id) || 0) -
+      (pReturnBeforeMap.get(id) || 0) +
+      (sReturnBeforeMap.get(id) || 0);
+
+    const purchasePcs = (purchaseInMap.get(id) || 0) - (pReturnInMap.get(id) || 0);
+    const salePcs = (saleInMap.get(id) || 0) - (sReturnInMap.get(id) || 0);
+    const closingPcs = openingPcs + purchasePcs - salePcs;
+
+    const packing = item.packing || 1;
+    const opening = splitCasePcsTrunc(openingPcs, packing);
+    const purchase = splitCasePcsTrunc(purchasePcs, packing);
+    const sale = splitCasePcsTrunc(salePcs, packing);
+    const closing = splitCasePcsTrunc(closingPcs, packing);
+
+    // `lastCostRate`/`purchaseRate` are on the item's own `purchaseQty` basis
+    // (e.g. "cost per Carton of N pieces"), same convention as
+    // `purchaseController.computeLine`'s own `pricePerPiece = rate/purchaseQty`
+    // — divide down to a per-piece rate before multiplying by a piece count.
+    const rate = item.lastCostRate || 0;
+    const ratePerPiece = rate / (item.purchaseQty || 1);
+
+    return {
+      itemId: item._id,
+      groupName: item.supplierId?.name || "Ungrouped",
+      itemCode: item.codeBarCode || "",
+      hsnCode: item.hsnCode || "",
+      itemName: item.itemName,
+      unit: item.uqcUnit || "",
+      weight: item.weightPerPiece || 0,
+      packing,
+      openingPcs,
+      purchasePcs,
+      salePcs,
+      closingPcs,
+      openingCase: opening.caseQty,
+      openingLoosePcs: opening.pcs,
+      purchaseCase: purchase.caseQty,
+      purchaseLoosePcs: purchase.pcs,
+      saleCase: sale.caseQty,
+      saleLoosePcs: sale.pcs,
+      closingCase: closing.caseQty,
+      closingLoosePcs: closing.pcs,
+      mrpRate: item.mrp || 0,
+      rate,
+      value: closingPcs * ratePerPiece,
+    };
+  });
+
+  const groupMap = new Map();
+  rowsRaw.forEach((r) => {
+    if (!groupMap.has(r.groupName)) groupMap.set(r.groupName, []);
+    groupMap.get(r.groupName).push(r);
+  });
+
+  function sumRows(rows) {
+    const s = {
+      openingPcs: 0, purchasePcs: 0, salePcs: 0, closingPcs: 0,
+      openingCase: 0, openingLoosePcs: 0, purchaseCase: 0, purchaseLoosePcs: 0,
+      saleCase: 0, saleLoosePcs: 0, closingCase: 0, closingLoosePcs: 0,
+      value: 0,
+    };
+    rows.forEach((r) => {
+      s.openingPcs += r.openingPcs; s.purchasePcs += r.purchasePcs; s.salePcs += r.salePcs; s.closingPcs += r.closingPcs;
+      s.openingCase += r.openingCase; s.openingLoosePcs += r.openingLoosePcs;
+      s.purchaseCase += r.purchaseCase; s.purchaseLoosePcs += r.purchaseLoosePcs;
+      s.saleCase += r.saleCase; s.saleLoosePcs += r.saleLoosePcs;
+      s.closingCase += r.closingCase; s.closingLoosePcs += r.closingLoosePcs;
+      s.value += r.value;
+    });
+    return s;
+  }
+
+  const groups = Array.from(groupMap.keys())
+    .sort((a, b) => a.localeCompare(b))
+    .map((name) => {
+      const rows = groupMap.get(name);
+      return { groupName: name, rows, total: sumRows(rows) };
+    });
+
+  return { groups, grandTotal: sumRows(rowsRaw), itemCount: rowsRaw.length };
+}
+
+// GET /api/reports/full-stock?companyId=&dateFrom=&dateTo=&supplierId=&search=
+const getFullStockReport = async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    const result = await buildFullStockReport(req.query);
+    res.status(200).json(result);
+  } catch (error) {
+    res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
+// GET /api/reports/full-stock/export?companyId=&dateFrom=&dateTo=&supplierId=&search=
+const exportFullStockReport = async (req, res) => {
+  try {
+    const { companyId } = req.query;
+    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    const { groups, grandTotal } = await buildFullStockReport(req.query, { cap: EXPORT_ROW_CAP });
+
+    const workbook = new ExcelJS.Workbook();
+    const sheet = workbook.addWorksheet("Full Stock Report");
+    const headers = [
+      "Group", "Item Code", "HSN Code", "Item", "Unit", "Weight", "Packing",
+      "Opening", "Purchase", "Sale", "Closing",
+      "Opng Case", "Opng Pcs", "Purc Case", "Purc Pcs", "Sale Case", "Sale Pcs", "Clsg Case", "Clsg Pcs",
+      "MRP Rate", "Rate", "Value",
+    ];
+    sheet.addRow(headers);
+    const headerRow = sheet.getRow(1);
+    headerRow.eachCell((cell) => {
+      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF111111" } };
+    });
+    sheet.columns.forEach((col) => { col.width = 13; });
+    sheet.getColumn(4).width = 28;
+
+    const rowValues = (r) => [
+      r.groupName, r.itemCode, r.hsnCode, r.itemName, r.unit, r.weight, r.packing,
+      r.openingPcs, r.purchasePcs, r.salePcs, r.closingPcs,
+      r.openingCase, r.openingLoosePcs, r.purchaseCase, r.purchaseLoosePcs,
+      r.saleCase, r.saleLoosePcs, r.closingCase, r.closingLoosePcs,
+      r.mrpRate, r.rate, Number(r.value.toFixed(2)),
+    ];
+    const totalValues = (label, t) => [
+      label, "", "", "", "", "", "",
+      t.openingPcs, t.purchasePcs, t.salePcs, t.closingPcs,
+      t.openingCase, t.openingLoosePcs, t.purchaseCase, t.purchaseLoosePcs,
+      t.saleCase, t.saleLoosePcs, t.closingCase, t.closingLoosePcs,
+      "", "", Number(t.value.toFixed(2)),
+    ];
+
+    groups.forEach((g) => {
+      g.rows.forEach((r) => sheet.addRow(rowValues(r)));
+      const totalRow = sheet.addRow(totalValues(`${g.groupName} - GROUP TOTAL`, g.total));
+      totalRow.font = { bold: true };
+      totalRow.eachCell((cell) => { cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0F0F0" } }; });
+    });
+    const grandRow = sheet.addRow(totalValues("GRAND TOTAL", grandTotal));
+    grandRow.font = { bold: true };
+    grandRow.eachCell((cell) => { cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFDDDDDD" } }; });
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename="Full_Stock_Report.xlsx"`);
+    await workbook.xlsx.write(res);
+    res.end();
+  } catch (error) {
+    sendExportError(res, error);
+  }
+};
+
 async function godownNameMap(companyId) {
   const list = await Godown.find({ companyId }).select("name").lean();
   return new Map(list.map((g) => [String(g._id), g.name]));
@@ -1210,6 +1446,7 @@ module.exports = {
   getSaleReport,
   getPurchaseReturnReport,
   getSaleReturnReport,
+  getFullStockReport,
   getCustomerLedger,
   getSupplierLedger,
   exportItemReport,
@@ -1219,6 +1456,7 @@ module.exports = {
   exportSaleReport,
   exportPurchaseReturnReport,
   exportSaleReturnReport,
+  exportFullStockReport,
   exportCustomerLedger,
   exportSupplierLedger,
 };
