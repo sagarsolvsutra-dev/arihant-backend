@@ -41,6 +41,19 @@ const UserSchema = new mongoose.Schema(
     lastLogin: {
       type: Date,
     },
+    // Only meaningful for role:"staff" — per-module CRUD grants, shaped as
+    // { purchase: {view,create,edit,delete}, sale: {...}, reports: {view},
+    // masters: {...} } (see utils/permissions.js's MODULE_ACTIONS for which
+    // actions apply to which module). company_admin/super_admin are never
+    // checked against this and always have full access regardless of what's
+    // stored here. Mixed rather than a typed sub-schema since the action
+    // keys present vary per module (e.g. "reports" only ever has "view") —
+    // utils/permissions.js's sanitizePermissions() is what actually
+    // constrains the shape before this is ever persisted.
+    permissions: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
   },
   {
     timestamps: true,

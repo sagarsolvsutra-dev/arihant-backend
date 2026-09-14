@@ -2,6 +2,7 @@ const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const Company = require("../models/Company");
 const { hashPassword, comparePassword } = require("../utils/crypto");
+const { sanitizePermissions } = require("../utils/permissions");
 
 const JWT_SECRET = process.env.JWT_SECRET || "arihant-erp-secret-key-2024";
 
@@ -23,6 +24,8 @@ const generateToken = (user) => {
       email: user.email,
       role: user.role,
       companyId: companyIdValue,
+      // Only meaningful for role:"staff" — see utils/permissions.js.
+      permissions: user.role === "staff" ? user.permissions || {} : {},
     },
     JWT_SECRET,
     { expiresIn: "24h" }
@@ -81,6 +84,7 @@ const login = async (req, res) => {
         role: user.role,
         companyId: user.companyId ? user.companyId._id : null,
         companyName: user.companyId ? user.companyId.name : null,
+        permissions: user.role === "staff" ? user.permissions || {} : {},
       },
     });
   } catch (error) {
@@ -116,6 +120,7 @@ const me = async (req, res) => {
         role: user.role,
         companyId: user.companyId ? user.companyId._id : null,
         companyName: user.companyId ? user.companyId.name : null,
+        permissions: user.role === "staff" ? user.permissions || {} : {},
       },
     });
   } catch (error) {
@@ -128,7 +133,7 @@ const me = async (req, res) => {
 // @route   POST /api/auth/register
 const register = async (req, res) => {
   try {
-    const { name, email, phone, password, role, companyId } = req.body;
+    const { name, email, phone, password, role, companyId, permissions } = req.body;
 
     if (!name || !email || !password || !role) {
       return res.status(400).json({
@@ -175,7 +180,11 @@ const register = async (req, res) => {
 
     const hashedPassword = await hashPassword(password);
 
-    // Create user
+    // Create user. permissions only means anything for role:"staff" (see
+    // utils/permissions.js — company_admin/super_admin are never checked
+    // against it) and is always run through sanitizePermissions before being
+    // persisted, same as userController.createStaff's own staff-creation
+    // path — never trust a client-submitted permissions object as-is.
     const user = await User.create({
       name,
       email: email.toLowerCase(),
@@ -184,6 +193,7 @@ const register = async (req, res) => {
       role,
       companyId: companyId || null,
       isActive: true,
+      permissions: role === "staff" ? sanitizePermissions(permissions) : {},
     });
 
     res.status(201).json({
@@ -195,6 +205,7 @@ const register = async (req, res) => {
         email: user.email,
         role: user.role,
         companyId: user.companyId,
+        permissions: user.permissions,
       },
     });
   } catch (error) {

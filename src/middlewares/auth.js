@@ -1,4 +1,5 @@
 const jwt = require("jsonwebtoken");
+const User = require("../models/User");
 
 const JWT_SECRET = process.env.JWT_SECRET || "arihant-erp-secret-key-2024";
 
@@ -29,6 +30,18 @@ const protect = (req, res, next) => {
       email: decoded.email,
       role: decoded.role,
       companyId: decoded.companyId || null,
+      // Only meaningful for role:"staff" (see utils/permissions.js). Still
+      // decoded from the JWT for reference, but — unlike role/companyId —
+      // NOT what requirePermission actually checks against anymore (see its
+      // own comment below): a real, reported bug showed this JWT snapshot
+      // going stale in exactly the way that matters most for this field —
+      // an admin grants a staff member a new permission while they're
+      // already logged in, the staff member's UI correctly shows the newly-
+      // unlocked button (the frontend's own periodic `/auth/me` re-check
+      // already refreshes localStorage's copy), but the actual write request
+      // 403'd anyway because the JWT baked in at login never got that grant.
+      // Shape: { moduleKey: { view, create, edit, delete } }.
+      permissions: (decoded.permissions && typeof decoded.permissions === "object") ? decoded.permissions : {},
     };
     next();
   } catch (error) {
@@ -104,4 +117,53 @@ const scopeCompany = (req, res, next) => {
   next();
 };
 
-module.exports = { protect, requireRole, scopeCompany };
+// HTTP method -> CRUD action. Used by requirePermission to decide which
+// specific grant (view/create/edit/delete) a given request actually needs.
+function methodToAction(method) {
+  if (method === "POST") return "create";
+  if (method === "PUT" || method === "PATCH") return "edit";
+  if (method === "DELETE") return "delete";
+  return "view"; // GET, and anything else, treated as a read
+}
+
+// Gates a route mount by per-module CRUD permission — must run after
+// protect(). Only ever checked for role:"staff"; company_admin/super_admin
+// always pass through untouched (see utils/permissions.js).
+//
+// { readOnly: true } (used for every master-data route mount — each master
+// resource is its own moduleKey now, e.g. "items"/"customers"/"godowns", not
+// one shared "masters" key) means: GET requests are ALWAYS allowed regardless
+// of the "view" grant — a deliberate, confirmed-with-the-user design choice,
+// not a gap. Master data (e.g. the customer list) is shared reference data
+// other modules need to function even without that specific module's own
+// permission at all (a staff member with only "sale" permission still needs
+// to read the customer list to pick one when making a sale, even with zero
+// "customers" grants) — the "view" grant on e.g. "customers" instead governs
+// whether the FRONTEND shows/allows navigating to that dedicated management
+// page, which this backend check can't distinguish from a dropdown read
+// since both hit the identical GET route. POST/PUT/DELETE on a readOnly-
+// mounted route are NOT exempted — those still require the matching
+// create/edit/delete grant, same as any other module.
+// Checked LIVE against the DB on every request, not against the JWT's own
+// (point-in-time-snapshot) permissions claim — see protect()'s comment above
+// for the real, reported bug this closes: a staff member granted a new
+// permission mid-session would otherwise keep getting 403'd on the exact
+// action they were just given, until they happened to log out and back in.
+// One extra indexed findById per permission-gated write is a fine trade for
+// not shipping that confusion — this app's traffic doesn't remotely
+// approach a scale where it matters.
+const requirePermission = (moduleKey, { readOnly = false } = {}) => async (req, res, next) => {
+  if (!req.user || req.user.role !== "staff") return next();
+  const action = methodToAction(req.method);
+  if (readOnly && action === "view") return next();
+  try {
+    const freshUser = await User.findById(req.user.userId).select("permissions").lean();
+    const perms = (freshUser && freshUser.permissions) || {};
+    if (perms[moduleKey] && perms[moduleKey][action]) return next();
+    return res.status(403).json({ message: `You don't have "${action}" permission for this module` });
+  } catch (error) {
+    return res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
+module.exports = { protect, requireRole, scopeCompany, requirePermission };
