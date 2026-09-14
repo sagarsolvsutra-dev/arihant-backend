@@ -30,8 +30,15 @@ function computeLine(raw, item) {
   const gstPercent = parseFloat(raw.gstPercent ?? item.gstPercentage) || 0;
 
   // Never trust the client to have blocked negative input — a negative quantity or
-  // rate here would silently corrupt Item stock via applyStockDelta.
-  if (caseQty < 0 || pcsQty < 0 || freeQty < 0 || beforeGstRate < 0 || lessRs < 0 || cdRs < 0 || lessPercent < 0 || cdPercent < 0) {
+  // rate here would silently corrupt Item stock via applyStockDelta. gstPercent was
+  // previously missing from this list — every other numeric field on the line was
+  // checked, but a negative gstPercent could drive netValue below taxableValue,
+  // bypassing the lessAmt+cdAmt discount-cap check a few lines below (which only
+  // guards against the discount fields doing the same thing).
+  if (
+    caseQty < 0 || pcsQty < 0 || freeQty < 0 || beforeGstRate < 0 || lessRs < 0 || cdRs < 0 ||
+    lessPercent < 0 || cdPercent < 0 || gstPercent < 0 || gstPercent > 100
+  ) {
     throw new Error(`Quantities and rates cannot be negative (item: ${item.itemName})`);
   }
   if (caseQty === 0 && pcsQty === 0) {
@@ -161,55 +168,84 @@ async function buildLines(rawItems, companyId) {
 // without picking a godown at all, so those buckets don't necessarily cover the whole
 // flat total. godownStock[] is purely a Purchase-driven, godown-scoped view alongside
 // the flat total, not its source of truth.
-async function applyStockDelta(lines, sign, companyId) {
-  for (const line of lines) {
-    const item = await Item.findOne({ _id: line.itemId, companyId });
-    if (!item) continue;
+async function applyOneLine(line, sign, companyId) {
+  const item = await Item.findOne({ _id: line.itemId, companyId });
+  if (!item) return;
 
-    const packing = parseFloat(item.packing) || 1;
+  const packing = parseFloat(item.packing) || 1;
 
-    const matchedEntry = findMatchedRateEntry(line, item);
-    if (matchedEntry) {
-      const entryPacking = parseFloat(matchedEntry.packing) || 1;
-      const entryNewPcs = (parseFloat(matchedEntry.openingStockFreshPcs) || 0) + sign * line.totalPieces;
-      matchedEntry.openingStockFreshPcs = entryNewPcs;
-      matchedEntry.openingStockFreshCase = entryPacking > 0 ? entryNewPcs / entryPacking : entryNewPcs;
+  const matchedEntry = findMatchedRateEntry(line, item);
+  if (matchedEntry) {
+    const entryPacking = parseFloat(matchedEntry.packing) || 1;
+    const entryNewPcs = (parseFloat(matchedEntry.openingStockFreshPcs) || 0) + sign * line.totalPieces;
+    matchedEntry.openingStockFreshPcs = entryNewPcs;
+    matchedEntry.openingStockFreshCase = entryPacking > 0 ? entryNewPcs / entryPacking : entryNewPcs;
 
-      if (!Array.isArray(matchedEntry.godownStock)) matchedEntry.godownStock = [];
-      let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(line.godownId));
-      if (!bucket) {
-        bucket = {
-          godownId: line.godownId,
-          openingStockFreshCase: 0,
-          openingStockFreshPcs: 0,
-          openingStockExpiredCase: 0,
-          openingStockExpiredPcs: 0,
-          openingStockDamagedCase: 0,
-          openingStockDamagedPcs: 0,
-        };
-        matchedEntry.godownStock.push(bucket);
-        bucket = matchedEntry.godownStock[matchedEntry.godownStock.length - 1];
-      }
-      const bucketNewPcs = (parseFloat(bucket.openingStockFreshPcs) || 0) + sign * line.totalPieces;
-      bucket.openingStockFreshPcs = bucketNewPcs;
-      bucket.openingStockFreshCase = entryPacking > 0 ? bucketNewPcs / entryPacking : bucketNewPcs;
-
-      if (sign > 0) {
-        matchedEntry.netCostSelfPerPiece = line.afterGstRate / entryPacking;
-      }
-      item.markModified("mrpEntries");
+    if (!Array.isArray(matchedEntry.godownStock)) matchedEntry.godownStock = [];
+    let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(line.godownId));
+    if (!bucket) {
+      bucket = {
+        godownId: line.godownId,
+        openingStockFreshCase: 0,
+        openingStockFreshPcs: 0,
+        openingStockExpiredCase: 0,
+        openingStockExpiredPcs: 0,
+        openingStockDamagedCase: 0,
+        openingStockDamagedPcs: 0,
+      };
+      matchedEntry.godownStock.push(bucket);
+      bucket = matchedEntry.godownStock[matchedEntry.godownStock.length - 1];
     }
-
-    const newPcs = (parseFloat(item.openingStockFreshPcs) || 0) + sign * line.totalPieces;
-    item.openingStockFreshPcs = newPcs;
-    item.openingStockFreshCase = packing > 0 ? newPcs / packing : newPcs;
+    const bucketNewPcs = (parseFloat(bucket.openingStockFreshPcs) || 0) + sign * line.totalPieces;
+    bucket.openingStockFreshPcs = bucketNewPcs;
+    bucket.openingStockFreshCase = entryPacking > 0 ? bucketNewPcs / entryPacking : bucketNewPcs;
 
     if (sign > 0) {
-      item.lastCostRate = line.afterGstRate;
-      item.purchaseRate = line.beforeGstRate;
+      matchedEntry.netCostSelfPerPiece = line.afterGstRate / entryPacking;
     }
+    item.markModified("mrpEntries");
+  }
 
-    await item.save();
+  const newPcs = (parseFloat(item.openingStockFreshPcs) || 0) + sign * line.totalPieces;
+  item.openingStockFreshPcs = newPcs;
+  item.openingStockFreshCase = packing > 0 ? newPcs / packing : newPcs;
+
+  if (sign > 0) {
+    item.lastCostRate = line.afterGstRate;
+    item.purchaseRate = line.beforeGstRate;
+  }
+
+  await item.save();
+}
+
+// Self-healing against a partial mid-loop failure: if line N of a multi-line
+// invoice throws (a transient write error, not a validation error — those
+// are all caught earlier in computeLine/buildLines before this ever runs),
+// lines 1..N-1 already committed their stock delta with no way to undo them
+// on their own. Track what actually succeeded and reverse exactly that
+// before re-throwing, so a caller never has to reason about "how far did it
+// get" — a failed applyStockDelta call is guaranteed to leave stock exactly
+// as it found it. This is what makes createX's "delete the doc on stock-
+// apply failure" compensating action actually sufficient (nothing else is
+// left to reverse), and what makes updateX's initial "reverse the old
+// lines" call safe to run outside its own try/catch — a failure there now
+// can't leave a half-reversed invoice with no way back.
+async function applyStockDelta(lines, sign, companyId) {
+  const applied = [];
+  try {
+    for (const line of lines) {
+      await applyOneLine(line, sign, companyId);
+      applied.push(line);
+    }
+  } catch (err) {
+    for (let i = applied.length - 1; i >= 0; i--) {
+      try {
+        await applyOneLine(applied[i], -sign, companyId);
+      } catch (rollbackErr) {
+        console.error("applyStockDelta: failed to roll back a partially-applied line — stock may be desynced", rollbackErr);
+      }
+    }
+    throw err;
   }
 }
 

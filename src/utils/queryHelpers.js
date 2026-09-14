@@ -34,4 +34,25 @@ function isValidObjectId(id) {
   return typeof id === "string" && mongoose.Types.ObjectId.isValid(id);
 }
 
-module.exports = { escapeRegex, searchRegex, clampLimit, clampPage, isValidObjectId };
+// Throws if `id` is set but doesn't resolve to a real document of `Model`
+// belonging to `companyId` — closes a cross-tenant reference leak: without
+// this, a client could set e.g. supplierId to another company's real
+// Supplier _id, and every place that later .populate()s the field (which
+// resolves purely by _id, no companyId filter of its own) would leak that
+// other company's data into this company's own records.
+async function assertRefBelongsToCompany(Model, id, companyId, fieldLabel) {
+  if (!id) return; // optional refs are allowed to be empty/null
+  const doc = await Model.exists({ _id: id, companyId });
+  if (!doc) {
+    throw new Error(`Invalid ${fieldLabel} — not found in this company`);
+  }
+}
+
+module.exports = {
+  escapeRegex,
+  searchRegex,
+  clampLimit,
+  clampPage,
+  isValidObjectId,
+  assertRefBelongsToCompany,
+};

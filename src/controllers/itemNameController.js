@@ -1,5 +1,7 @@
 const ItemName = require("../models/ItemName");
-const { searchRegex } = require("../utils/queryHelpers");
+const Supplier = require("../models/Supplier");
+const ItemSubGroup = require("../models/ItemSubGroup");
+const { searchRegex, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 exports.createItemName = async (req, res) => {
   try {
@@ -7,6 +9,9 @@ exports.createItemName = async (req, res) => {
     if (!companyId || !supplierId || !name) {
       return res.status(400).json({ message: "Company ID, Supplier ID, and Name are required" });
     }
+
+    // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
+    await assertRefBelongsToCompany(Supplier, supplierId, companyId, "Supplier");
 
     const exists = await ItemName.findOne({ companyId, supplierId, name: name.trim() });
     if (exists) {
@@ -91,7 +96,10 @@ exports.updateItemName = async (req, res) => {
     }
 
     if (name !== undefined) itemName.name = name.trim();
-    if (supplierId !== undefined) itemName.supplierId = supplierId;
+    if (supplierId !== undefined) {
+      await assertRefBelongsToCompany(Supplier, supplierId, itemName.companyId, "Supplier");
+      itemName.supplierId = supplierId;
+    }
     if (isActive !== undefined) itemName.isActive = isActive;
 
     await itemName.save();
@@ -104,10 +112,20 @@ exports.updateItemName = async (req, res) => {
 exports.deleteItemName = async (req, res) => {
   try {
     const { id } = req.params;
-    const itemName = await ItemName.findOneAndDelete({ _id: id, companyId: req.effectiveCompanyId });
+    const itemName = await ItemName.findOne({ _id: id, companyId: req.effectiveCompanyId });
     if (!itemName) {
       return res.status(404).json({ message: "Item Name not found" });
     }
+
+    // ItemSubGroup.itemNameId is a real, optional ref — hard-deleting a still-
+    // referenced Item Name leaves it dangling (same pattern as every sibling
+    // master controller's own reference check, e.g. godownGroupController's).
+    const hasItemSubGroup = await ItemSubGroup.exists({ companyId: itemName.companyId, itemNameId: itemName._id });
+    if (hasItemSubGroup) {
+      return res.status(400).json({ message: "Cannot delete this Item Name — one or more Item Sub Groups still reference it." });
+    }
+
+    await itemName.deleteOne();
     res.status(200).json({ message: "Item Name deleted successfully" });
   } catch (error) {
     res.status(500).json({ message: error.message });

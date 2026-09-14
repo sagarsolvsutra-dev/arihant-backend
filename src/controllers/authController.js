@@ -151,9 +151,14 @@ const register = async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid role" });
     }
 
-    // Check existing user
+    // Check existing user — an ACTIVE match is a genuine duplicate (unchanged
+    // behavior); an INACTIVE match is reactivated below instead of being
+    // rejected or duplicated, mirroring companyController.updateCompany's own
+    // admin-reactivation logic (see its "Reactivate rather than duplicate"
+    // comment) — without this, an email could never be reused for a new
+    // company_admin/staff account once its previous row was soft-deactivated.
     const existing = await User.findOne({ email: email.toLowerCase() });
-    if (existing) {
+    if (existing && existing.isActive) {
       return res
         .status(400)
         .json({ success: false, message: "Email already registered" });
@@ -180,21 +185,36 @@ const register = async (req, res) => {
 
     const hashedPassword = await hashPassword(password);
 
-    // Create user. permissions only means anything for role:"staff" (see
-    // utils/permissions.js — company_admin/super_admin are never checked
-    // against it) and is always run through sanitizePermissions before being
+    // permissions only means anything for role:"staff" (see utils/
+    // permissions.js — company_admin/super_admin are never checked against
+    // it) and is always run through sanitizePermissions before being
     // persisted, same as userController.createStaff's own staff-creation
     // path — never trust a client-submitted permissions object as-is.
-    const user = await User.create({
-      name,
-      email: email.toLowerCase(),
-      phone,
-      password: hashedPassword,
-      role,
-      companyId: companyId || null,
-      isActive: true,
-      permissions: role === "staff" ? sanitizePermissions(permissions) : {},
-    });
+    const sanitizedPermissions = role === "staff" ? sanitizePermissions(permissions) : {};
+
+    let user;
+    if (existing) {
+      // Reactivate the existing inactive row instead of creating a duplicate.
+      existing.name = name;
+      existing.phone = phone;
+      existing.password = hashedPassword;
+      existing.role = role;
+      existing.companyId = companyId || null;
+      existing.isActive = true;
+      existing.permissions = sanitizedPermissions;
+      user = await existing.save();
+    } else {
+      user = await User.create({
+        name,
+        email: email.toLowerCase(),
+        phone,
+        password: hashedPassword,
+        role,
+        companyId: companyId || null,
+        isActive: true,
+        permissions: sanitizedPermissions,
+      });
+    }
 
     res.status(201).json({
       success: true,

@@ -91,7 +91,13 @@ function dateRangeFilter(field, dateFrom, dateTo) {
 const getItemReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search = "", page = 1, limit = 10 } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const itemQuery = { companyId };
     if (search && search.trim()) itemQuery.itemName = searchRegex(search.trim());
@@ -173,7 +179,13 @@ const getItemReport = async (req, res) => {
 const getCustomerReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search = "", page = 1, limit = 10 } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const query = { companyId };
     if (search && search.trim()) {
@@ -254,7 +266,13 @@ const getCustomerReport = async (req, res) => {
 const getSupplierReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search = "", page = 1, limit = 10 } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const query = { companyId };
     if (search && search.trim()) {
@@ -373,7 +391,12 @@ async function buildLineReport({
       { $unwind: { path: `$${lookup.as}`, preserveNullAndEmptyArrays: true } }
     );
   }
-  pipeline.push({ $unwind: "$items" });
+  // includeArrayIndex gives every unwound line a genuinely unique sort key
+  // alongside the parent doc's _id/date (both shared by every sibling line of
+  // the same invoice) — without it, $skip/$limit pagination across separate
+  // query invocations has no deterministic tie-break between sibling lines,
+  // which can show a line twice or skip one across two page loads.
+  pipeline.push({ $unwind: { path: "$items", includeArrayIndex: "lineIdx" } });
   if (lineMatch && Object.keys(lineMatch).length) pipeline.push({ $match: lineMatch });
   // Every one of these 4 line-level reports shows an Item Name column, and each
   // one needs its Sub Group alongside it — the line only snapshots itemName, not
@@ -386,7 +409,7 @@ async function buildLineReport({
     { $lookup: { from: "itemsubgroups", localField: "itemMaster.itemSubGroupId", foreignField: "_id", as: "subGroupDoc" } },
     { $unwind: { path: "$subGroupDoc", preserveNullAndEmptyArrays: true } }
   );
-  pipeline.push({ $sort: { [dateField]: -1, _id: -1 } });
+  pipeline.push({ $sort: { [dateField]: -1, _id: -1, lineIdx: 1 } });
   pipeline.push({
     $facet: {
       data: [
@@ -445,7 +468,13 @@ function buildLineFilterParams(req) {
 const getPurchaseReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search, parsedPage, parsedLimit, lineMatch } = buildLineFilterParams(req);
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("invoiceDate", dateFrom, dateTo) };
     if (search && search.trim()) match.invoiceNo = searchRegex(search.trim());
@@ -476,7 +505,13 @@ const getSaleReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search, parsedPage, parsedLimit, lineMatch } = buildLineFilterParams(req);
     const { customerId } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("invoiceDate", dateFrom, dateTo) };
     if (search && search.trim()) match.invoiceNo = searchRegex(search.trim());
@@ -509,7 +544,13 @@ const getPurchaseReturnReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search, parsedPage, parsedLimit, lineMatch } = buildLineFilterParams(req);
     const { supplierId, condition } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("returnDate", dateFrom, dateTo) };
     if (search && search.trim()) match.returnNo = searchRegex(search.trim());
@@ -543,7 +584,13 @@ const getSaleReturnReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search, parsedPage, parsedLimit, lineMatch } = buildLineFilterParams(req);
     const { customerId, condition } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("returnDate", dateFrom, dateTo) };
     if (search && search.trim()) match.returnNo = searchRegex(search.trim());
@@ -640,7 +687,13 @@ const getCustomerLedger = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo } = req.query;
     const { customerId } = req.params;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
     if (!isValidObjectId(customerId)) return res.status(400).json({ message: "Invalid customer id" });
 
     const loaded = await loadCustomerLedgerEntries(companyId, customerId);
@@ -702,7 +755,13 @@ const getSupplierLedger = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo } = req.query;
     const { supplierId } = req.params;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
     if (!isValidObjectId(supplierId)) return res.status(400).json({ message: "Invalid supplier id" });
 
     const loaded = await loadSupplierLedgerEntries(companyId, supplierId);
@@ -890,7 +949,13 @@ async function buildFullStockReport(query, { cap = FULL_STOCK_ROW_CAP } = {}) {
 const getFullStockReport = async (req, res) => {
   try {
     const { companyId } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
     const result = await buildFullStockReport(req.query);
     res.status(200).json(result);
   } catch (error) {
@@ -902,7 +967,13 @@ const getFullStockReport = async (req, res) => {
 const exportFullStockReport = async (req, res) => {
   try {
     const { companyId } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
     const { groups, grandTotal } = await buildFullStockReport(req.query, { cap: EXPORT_ROW_CAP });
 
     const workbook = new ExcelJS.Workbook();
@@ -971,7 +1042,13 @@ function sendExportError(res, error) {
 const exportItemReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search = "" } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const itemQuery = { companyId };
     if (search && search.trim()) itemQuery.itemName = searchRegex(search.trim());
@@ -1041,7 +1118,13 @@ const exportItemReport = async (req, res) => {
 const exportCustomerReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search = "" } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const query = { companyId };
     if (search && search.trim()) {
@@ -1104,7 +1187,13 @@ const exportCustomerReport = async (req, res) => {
 const exportSupplierReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, search = "" } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const query = { companyId };
     if (search && search.trim()) {
@@ -1175,7 +1264,13 @@ const exportSupplierReport = async (req, res) => {
 const exportPurchaseReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, itemId, godownId, search = "" } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("invoiceDate", dateFrom, dateTo) };
     if (search && search.trim()) match.invoiceNo = searchRegex(search.trim());
@@ -1221,7 +1316,13 @@ const exportPurchaseReport = async (req, res) => {
 const exportSaleReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, itemId, godownId, customerId, search = "" } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("invoiceDate", dateFrom, dateTo) };
     if (search && search.trim()) match.invoiceNo = searchRegex(search.trim());
@@ -1270,7 +1371,13 @@ const exportSaleReport = async (req, res) => {
 const exportPurchaseReturnReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, itemId, godownId, supplierId, condition, search = "" } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("returnDate", dateFrom, dateTo) };
     if (search && search.trim()) match.returnNo = searchRegex(search.trim());
@@ -1320,7 +1427,13 @@ const exportPurchaseReturnReport = async (req, res) => {
 const exportSaleReturnReport = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo, itemId, godownId, customerId, condition, search = "" } = req.query;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
 
     const match = { companyId: oid(companyId), ...dateRangeFilter("returnDate", dateFrom, dateTo) };
     if (search && search.trim()) match.returnNo = searchRegex(search.trim());
@@ -1401,7 +1514,13 @@ const exportCustomerLedger = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo } = req.query;
     const { customerId } = req.params;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
     if (!isValidObjectId(customerId)) return res.status(400).json({ message: "Invalid customer id" });
 
     const loaded = await loadCustomerLedgerEntries(companyId, customerId);
@@ -1422,7 +1541,13 @@ const exportSupplierLedger = async (req, res) => {
   try {
     const { companyId, dateFrom, dateTo } = req.query;
     const { supplierId } = req.params;
-    if (!companyId) return res.status(400).json({ message: "companyId is required" });
+    // super_admin calling with no explicit companyId gets `{ $ne: null }` from
+    // scopeCompany as its "match any company" sentinel — passing that straight
+    // into `new mongoose.Types.ObjectId(...)` throws a raw BSON cast error, a
+    // 500. A specific, ObjectId-shaped companyId is required for every report.
+    if (!companyId || !isValidObjectId(companyId)) {
+      return res.status(400).json({ message: "A specific companyId is required for this report" });
+    }
     if (!isValidObjectId(supplierId)) return res.status(400).json({ message: "Invalid supplier id" });
 
     const loaded = await loadSupplierLedgerEntries(companyId, supplierId);

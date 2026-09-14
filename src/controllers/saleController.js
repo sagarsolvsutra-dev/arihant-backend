@@ -32,8 +32,12 @@ function computeLine(raw, item) {
   const gstPercent = parseFloat(raw.gstPercent ?? item.gstPercentage) || 0;
 
   // Never trust the client to have blocked negative input — a negative quantity or
-  // rate here would silently corrupt Item stock via applyStockDelta.
-  if (caseQty < 0 || pcsQty < 0 || freeQty < 0 || afterGstRate < 0 || lessRs < 0 || cdRs < 0 || lessPercent < 0 || cdPercent < 0) {
+  // rate here would silently corrupt Item stock via applyStockDelta. gstPercent was
+  // previously missing from this list.
+  if (
+    caseQty < 0 || pcsQty < 0 || freeQty < 0 || afterGstRate < 0 || lessRs < 0 || cdRs < 0 ||
+    lessPercent < 0 || cdPercent < 0 || gstPercent < 0 || gstPercent > 100
+  ) {
     throw new Error(`Quantities and rates cannot be negative (item: ${item.itemName})`);
   }
   if (caseQty === 0 && pcsQty === 0) {
@@ -189,47 +193,68 @@ async function assertSufficientStock(lines, companyId) {
 // per-godown-bucket upsert, same "flat fields are the source of truth, godownStock is
 // a Purchase/Sale-driven supplementary view" invariant. `companyId` scopes the Item
 // lookup so a line can never mutate a different company's Item document.
-async function applyStockDelta(lines, sign, companyId) {
-  for (const line of lines) {
-    const item = await Item.findOne({ _id: line.itemId, companyId });
-    if (!item) continue;
+async function applyOneLine(line, sign, companyId) {
+  const item = await Item.findOne({ _id: line.itemId, companyId });
+  if (!item) return;
 
-    const packing = parseFloat(item.packing) || 1;
+  const packing = parseFloat(item.packing) || 1;
 
-    const matchedEntry = findMatchedRateEntry(line, item);
-    if (matchedEntry) {
-      const entryPacking = parseFloat(matchedEntry.packing) || 1;
-      const entryNewPcs = (parseFloat(matchedEntry.openingStockFreshPcs) || 0) + sign * line.totalPieces;
-      matchedEntry.openingStockFreshPcs = entryNewPcs;
-      matchedEntry.openingStockFreshCase = entryPacking > 0 ? entryNewPcs / entryPacking : entryNewPcs;
+  const matchedEntry = findMatchedRateEntry(line, item);
+  if (matchedEntry) {
+    const entryPacking = parseFloat(matchedEntry.packing) || 1;
+    const entryNewPcs = (parseFloat(matchedEntry.openingStockFreshPcs) || 0) + sign * line.totalPieces;
+    matchedEntry.openingStockFreshPcs = entryNewPcs;
+    matchedEntry.openingStockFreshCase = entryPacking > 0 ? entryNewPcs / entryPacking : entryNewPcs;
 
-      if (!Array.isArray(matchedEntry.godownStock)) matchedEntry.godownStock = [];
-      let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(line.godownId));
-      if (!bucket) {
-        bucket = {
-          godownId: line.godownId,
-          openingStockFreshCase: 0,
-          openingStockFreshPcs: 0,
-          openingStockExpiredCase: 0,
-          openingStockExpiredPcs: 0,
-          openingStockDamagedCase: 0,
-          openingStockDamagedPcs: 0,
-        };
-        matchedEntry.godownStock.push(bucket);
-        bucket = matchedEntry.godownStock[matchedEntry.godownStock.length - 1];
-      }
-      const bucketNewPcs = (parseFloat(bucket.openingStockFreshPcs) || 0) + sign * line.totalPieces;
-      bucket.openingStockFreshPcs = bucketNewPcs;
-      bucket.openingStockFreshCase = entryPacking > 0 ? bucketNewPcs / entryPacking : bucketNewPcs;
-
-      item.markModified("mrpEntries");
+    if (!Array.isArray(matchedEntry.godownStock)) matchedEntry.godownStock = [];
+    let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(line.godownId));
+    if (!bucket) {
+      bucket = {
+        godownId: line.godownId,
+        openingStockFreshCase: 0,
+        openingStockFreshPcs: 0,
+        openingStockExpiredCase: 0,
+        openingStockExpiredPcs: 0,
+        openingStockDamagedCase: 0,
+        openingStockDamagedPcs: 0,
+      };
+      matchedEntry.godownStock.push(bucket);
+      bucket = matchedEntry.godownStock[matchedEntry.godownStock.length - 1];
     }
+    const bucketNewPcs = (parseFloat(bucket.openingStockFreshPcs) || 0) + sign * line.totalPieces;
+    bucket.openingStockFreshPcs = bucketNewPcs;
+    bucket.openingStockFreshCase = entryPacking > 0 ? bucketNewPcs / entryPacking : bucketNewPcs;
 
-    const newPcs = (parseFloat(item.openingStockFreshPcs) || 0) + sign * line.totalPieces;
-    item.openingStockFreshPcs = newPcs;
-    item.openingStockFreshCase = packing > 0 ? newPcs / packing : newPcs;
+    item.markModified("mrpEntries");
+  }
 
-    await item.save();
+  const newPcs = (parseFloat(item.openingStockFreshPcs) || 0) + sign * line.totalPieces;
+  item.openingStockFreshPcs = newPcs;
+  item.openingStockFreshCase = packing > 0 ? newPcs / packing : newPcs;
+
+  await item.save();
+}
+
+// Self-healing against a partial mid-loop failure — see purchaseController's
+// identical helper for the full rationale. If line N throws, lines 1..N-1
+// that already committed are reversed here before re-throwing, so a failed
+// call never leaves stock partially applied relative to where it started.
+async function applyStockDelta(lines, sign, companyId) {
+  const applied = [];
+  try {
+    for (const line of lines) {
+      await applyOneLine(line, sign, companyId);
+      applied.push(line);
+    }
+  } catch (err) {
+    for (let i = applied.length - 1; i >= 0; i--) {
+      try {
+        await applyOneLine(applied[i], -sign, companyId);
+      } catch (rollbackErr) {
+        console.error("applyStockDelta: failed to roll back a partially-applied line — stock may be desynced", rollbackErr);
+      }
+    }
+    throw err;
   }
 }
 

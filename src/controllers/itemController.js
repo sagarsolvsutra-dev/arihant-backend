@@ -4,10 +4,15 @@ const Sale = require("../models/Sale");
 const PurchaseReturn = require("../models/PurchaseReturn");
 const SaleReturn = require("../models/SaleReturn");
 const StockTransfer = require("../models/StockTransfer");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const Supplier = require("../models/Supplier");
+const ItemSubGroup = require("../models/ItemSubGroup");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 // An item must always keep at least one MRP entry, and MRP values must stay
 // unique per item (Purchase's rate lookup identifies an entry by its MRP).
+// Also rejects any negative pricing/packing field within an entry — only
+// parseFloat(x)||0-style fallbacks guarded these before, which catches
+// NaN/falsy but lets a genuine negative number straight through.
 function validateMrpEntries(entries) {
   if (!Array.isArray(entries) || entries.length === 0) {
     return "At least one MRP entry is required";
@@ -15,6 +20,10 @@ function validateMrpEntries(entries) {
   const seen = new Set();
   for (const entry of entries) {
     const mrp = parseFloat(entry.mrp) || 0;
+    if (mrp < 0) return "MRP cannot be negative";
+    if (parseFloat(entry.purchaseRate) < 0) return "Purchase Rate cannot be negative";
+    if (parseFloat(entry.discountPercentage) < 0) return "Discount Percentage cannot be negative";
+    if (parseFloat(entry.packing) < 0) return "Packing cannot be negative";
     if (seen.has(mrp)) {
       return `Duplicate MRP entry: ${mrp}`;
     }
@@ -98,6 +107,30 @@ const createItem = async (req, res) => {
     if (!companyId || !itemName) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
+
+    // Cross-tenant reference leak guard — a client-supplied supplierId/
+    // itemSubGroupId must actually belong to this same company before it's
+    // persisted and later .populate()d (which resolves purely by _id, no
+    // companyId filter of its own).
+    await assertRefBelongsToCompany(Supplier, supplierId, companyId, "Supplier");
+    await assertRefBelongsToCompany(ItemSubGroup, itemSubGroupId, companyId, "Item Sub Group");
+
+    // Reject negative numeric fields — a bare `parseFloat(x) || 0` fallback
+    // (used throughout this handler) only catches NaN/falsy, not a genuine
+    // negative number.
+    if (parseFloat(purchaseRate) < 0) throw new Error("Purchase Rate cannot be negative");
+    if (parseFloat(salesRate) < 0) throw new Error("Sales Rate cannot be negative");
+    if (parseFloat(mrp) < 0) throw new Error("MRP cannot be negative");
+    if (parseFloat(wholeSaleRate) < 0) throw new Error("Whole Sale Rate cannot be negative");
+    if (parseFloat(retailRate) < 0) throw new Error("Retail Rate cannot be negative");
+    if (parseFloat(distributorRate) < 0) throw new Error("Distributor Rate cannot be negative");
+    if (parseFloat(discountPercentage) < 0) throw new Error("Discount Percentage cannot be negative");
+    if (parseFloat(gstPercentage) < 0) throw new Error("GST Percentage cannot be negative");
+    if (parseFloat(commissionRate) < 0) throw new Error("Commission Rate cannot be negative");
+    if (parseFloat(weightPerPiece) < 0) throw new Error("Weight Per Piece cannot be negative");
+    if (parseFloat(packing) < 0) throw new Error("Packing cannot be negative");
+    if (parseFloat(minStockQty) < 0) throw new Error("Min Stock Qty cannot be negative");
+    if (parseFloat(maxStockQty) < 0) throw new Error("Max Stock Qty cannot be negative");
 
     // Item Name + Sub Group together identify a unique product — the same Item Name
     // can legitimately repeat across different Sub Groups (see the matching index on
@@ -272,21 +305,54 @@ const updateItem = async (req, res) => {
     if (itemName !== undefined) item.itemName = itemName.trim();
 
     if (alias !== undefined) item.alias = alias.trim() || "";
-    if (supplierId !== undefined) item.supplierId = supplierId;
-    if (itemSubGroupId !== undefined) item.itemSubGroupId = itemSubGroupId || null;
+    if (supplierId !== undefined) {
+      await assertRefBelongsToCompany(Supplier, supplierId, item.companyId, "Supplier");
+      item.supplierId = supplierId;
+    }
+    if (itemSubGroupId !== undefined) {
+      await assertRefBelongsToCompany(ItemSubGroup, itemSubGroupId, item.companyId, "Item Sub Group");
+      item.itemSubGroupId = itemSubGroupId || null;
+    }
     if (hsnCode !== undefined) item.hsnCode = hsnCode.trim() || "";
     if (uqcUnit !== undefined) item.uqcUnit = uqcUnit;
-    if (purchaseRate !== undefined) item.purchaseRate = parseFloat(purchaseRate) || 0;
-    if (salesRate !== undefined) item.salesRate = parseFloat(salesRate) || 0;
-    if (mrp !== undefined) item.mrp = parseFloat(mrp) || 0;
-    if (wholeSaleRate !== undefined) item.wholeSaleRate = parseFloat(wholeSaleRate) || 0;
-    if (retailRate !== undefined) item.retailRate = parseFloat(retailRate) || 0;
-    if (commissionRate !== undefined) item.commissionRate = parseFloat(commissionRate) || 0;
-    if (minStockQty !== undefined) item.minStockQty = parseFloat(minStockQty) || 0;
-    if (maxStockQty !== undefined) item.maxStockQty = parseFloat(maxStockQty) || 0;
+    if (purchaseRate !== undefined) {
+      if (parseFloat(purchaseRate) < 0) throw new Error("Purchase Rate cannot be negative");
+      item.purchaseRate = parseFloat(purchaseRate) || 0;
+    }
+    if (salesRate !== undefined) {
+      if (parseFloat(salesRate) < 0) throw new Error("Sales Rate cannot be negative");
+      item.salesRate = parseFloat(salesRate) || 0;
+    }
+    if (mrp !== undefined) {
+      if (parseFloat(mrp) < 0) throw new Error("MRP cannot be negative");
+      item.mrp = parseFloat(mrp) || 0;
+    }
+    if (wholeSaleRate !== undefined) {
+      if (parseFloat(wholeSaleRate) < 0) throw new Error("Whole Sale Rate cannot be negative");
+      item.wholeSaleRate = parseFloat(wholeSaleRate) || 0;
+    }
+    if (retailRate !== undefined) {
+      if (parseFloat(retailRate) < 0) throw new Error("Retail Rate cannot be negative");
+      item.retailRate = parseFloat(retailRate) || 0;
+    }
+    if (commissionRate !== undefined) {
+      if (parseFloat(commissionRate) < 0) throw new Error("Commission Rate cannot be negative");
+      item.commissionRate = parseFloat(commissionRate) || 0;
+    }
+    if (minStockQty !== undefined) {
+      if (parseFloat(minStockQty) < 0) throw new Error("Min Stock Qty cannot be negative");
+      item.minStockQty = parseFloat(minStockQty) || 0;
+    }
+    if (maxStockQty !== undefined) {
+      if (parseFloat(maxStockQty) < 0) throw new Error("Max Stock Qty cannot be negative");
+      item.maxStockQty = parseFloat(maxStockQty) || 0;
+    }
     if (isActive !== undefined) item.isActive = isActive;
-    
-    if (gstPercentage !== undefined) item.gstPercentage = parseFloat(gstPercentage) || 0;
+
+    if (gstPercentage !== undefined) {
+      if (parseFloat(gstPercentage) < 0) throw new Error("GST Percentage cannot be negative");
+      item.gstPercentage = parseFloat(gstPercentage) || 0;
+    }
     if (hsnPrint !== undefined) item.hsnPrint = hsnPrint.trim() || "";
     if (codeBarCode !== undefined) {
       const trimmedCode = codeBarCode.trim() || "";
@@ -302,11 +368,20 @@ const updateItem = async (req, res) => {
       }
       item.codeBarCode = trimmedCode;
     }
-    if (packing !== undefined) item.packing = parseFloat(packing) || 1;
-    if (weightPerPiece !== undefined) item.weightPerPiece = parseFloat(weightPerPiece) || 0;
+    if (packing !== undefined) {
+      if (parseFloat(packing) < 0) throw new Error("Packing cannot be negative");
+      item.packing = parseFloat(packing) || 1;
+    }
+    if (weightPerPiece !== undefined) {
+      if (parseFloat(weightPerPiece) < 0) throw new Error("Weight Per Piece cannot be negative");
+      item.weightPerPiece = parseFloat(weightPerPiece) || 0;
+    }
     if (schemeRemark !== undefined) item.schemeRemark = schemeRemark.trim() || "";
     if (mrpActive !== undefined) item.mrpActive = mrpActive;
-    if (discountPercentage !== undefined) item.discountPercentage = parseFloat(discountPercentage) || 0;
+    if (discountPercentage !== undefined) {
+      if (parseFloat(discountPercentage) < 0) throw new Error("Discount Percentage cannot be negative");
+      item.discountPercentage = parseFloat(discountPercentage) || 0;
+    }
     if (marginToCostRetailer !== undefined) item.marginToCostRetailer = parseFloat(marginToCostRetailer) || 0;
     if (marginToCostWholesaler !== undefined) item.marginToCostWholesaler = parseFloat(marginToCostWholesaler) || 0;
     if (marginToMrpRetailer !== undefined) item.marginToMrpRetailer = parseFloat(marginToMrpRetailer) || 0;
@@ -321,7 +396,10 @@ const updateItem = async (req, res) => {
     if (purchaseQty !== undefined) item.purchaseQty = parseFloat(purchaseQty) || 1;
     if (salesType !== undefined) item.salesType = salesType;
     if (salesQty !== undefined) item.salesQty = parseFloat(salesQty) || 1;
-    if (distributorRate !== undefined) item.distributorRate = parseFloat(distributorRate) || 0;
+    if (distributorRate !== undefined) {
+      if (parseFloat(distributorRate) < 0) throw new Error("Distributor Rate cannot be negative");
+      item.distributorRate = parseFloat(distributorRate) || 0;
+    }
     if (marginToCostDistributor !== undefined) item.marginToCostDistributor = parseFloat(marginToCostDistributor) || 0;
     if (marginToMrpDistributor !== undefined) item.marginToMrpDistributor = parseFloat(marginToMrpDistributor) || 0;
     if (netCostRetailer !== undefined) item.netCostRetailer = parseFloat(netCostRetailer) || 0;

@@ -3,8 +3,9 @@ const Item = require("../models/Item");
 const ItemName = require("../models/ItemName");
 const ItemSubGroup = require("../models/ItemSubGroup");
 const PurchaseReturn = require("../models/PurchaseReturn");
+const SupplierGroup = require("../models/SupplierGroup");
 const { sendError } = require("../utils/errorHandler");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 const getSuppliers = async (req, res) => {
   try {
@@ -73,6 +74,9 @@ const createSupplier = async (req, res) => {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
+    // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
+    await assertRefBelongsToCompany(SupplierGroup, supplierGroupId, companyId, "Supplier Group");
+
     const supplierExists = await Supplier.findOne({ companyId, name });
     if (supplierExists) {
       return res.status(400).json({ message: "Supplier already exists in this company" });
@@ -95,7 +99,7 @@ const createSupplier = async (req, res) => {
       panNo: panNo?.trim() || "",
       supplierGroupId,
       balanceMethod: balanceMethod || "Bill by bill",
-      creditDays: creditDays !== undefined ? Number(creditDays) : 0,
+      creditDays: parseInt(creditDays) || 0,
       isActive: isActive !== undefined ? isActive : true,
     });
 
@@ -137,9 +141,12 @@ const updateSupplier = async (req, res) => {
     if (pincode !== undefined) supplier.pincode = pincode.trim() || "";
     if (gstNo !== undefined) supplier.gstNo = gstNo.trim() || "";
     if (panNo !== undefined) supplier.panNo = panNo.trim() || "";
-    if (supplierGroupId !== undefined) supplier.supplierGroupId = supplierGroupId;
+    if (supplierGroupId !== undefined) {
+      await assertRefBelongsToCompany(SupplierGroup, supplierGroupId, supplier.companyId, "Supplier Group");
+      supplier.supplierGroupId = supplierGroupId;
+    }
     if (balanceMethod !== undefined) supplier.balanceMethod = balanceMethod;
-    if (creditDays !== undefined) supplier.creditDays = Number(creditDays);
+    if (creditDays !== undefined) supplier.creditDays = parseInt(creditDays) || 0;
     if (isActive !== undefined) supplier.isActive = isActive;
 
     await supplier.save();

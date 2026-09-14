@@ -4,9 +4,20 @@ const { hashPassword } = require("../utils/crypto");
 
 // @desc    Get single company by ID with admin details
 // @route   GET /api/companies/:id
+// company_admin/staff may only ever fetch their OWN company — this route has
+// no requireRole gate (every logged-in role needs it, e.g. CompanyContext),
+// so without this check a company_admin/staff could pass any other
+// company's real _id and read its GST No/PAN No plus its admin's real name/
+// email/phone. Confirmed as a real, live cross-tenant data leak — not a
+// documented/deliberate trade-off. super_admin is unrestricted, as before.
 const getCompanyById = async (req, res) => {
   try {
     const { id } = req.params;
+    if (req.user.role !== "super_admin" && String(req.user.companyId) !== String(id)) {
+      return res
+        .status(403)
+        .json({ success: false, message: "Forbidden" });
+    }
     const company = await Company.findById(id);
     if (!company) {
       return res
@@ -39,9 +50,15 @@ const getCompanyById = async (req, res) => {
 
 // @desc    Get all companies with admin counts
 // @route   GET /api/companies
+// Same tenant-isolation gap as getCompanyById above (no requireRole gate on
+// this route) — company_admin/staff must only ever see their OWN company in
+// this list, never every other real tenant's GST/PAN/contact info.
+// super_admin is unrestricted, as before (the super-admin Companies page and
+// the "Add User" company dropdown both need the full list).
 const getCompanies = async (req, res) => {
   try {
-    const companies = await Company.find().sort({ createdAt: -1 }).lean();
+    const filter = req.user.role === "super_admin" ? {} : { _id: req.user.companyId };
+    const companies = await Company.find(filter).sort({ createdAt: -1 }).lean();
 
     const counts = await User.aggregate([
       { $match: { role: "company_admin", isActive: true } },

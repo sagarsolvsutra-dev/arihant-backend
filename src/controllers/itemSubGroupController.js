@@ -1,5 +1,8 @@
 const ItemSubGroup = require("../models/ItemSubGroup");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const Item = require("../models/Item");
+const Supplier = require("../models/Supplier");
+const ItemName = require("../models/ItemName");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 const getItemSubGroups = async (req, res) => {
   try {
@@ -43,6 +46,10 @@ const createItemSubGroup = async (req, res) => {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
+    // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
+    await assertRefBelongsToCompany(Supplier, supplierId, companyId, "Supplier");
+    await assertRefBelongsToCompany(ItemName, itemNameId, companyId, "Item Name");
+
     const exists = await ItemSubGroup.findOne({ companyId, name: name.trim() });
     if (exists) {
       return res.status(400).json({ message: "Item Sub Group already exists in this company" });
@@ -85,8 +92,14 @@ const updateItemSubGroup = async (req, res) => {
       subGroup.name = trimmedName;
     }
 
-    if (req.body.supplierId !== undefined) subGroup.supplierId = req.body.supplierId;
-    if (req.body.itemNameId !== undefined) subGroup.itemNameId = req.body.itemNameId;
+    if (req.body.supplierId !== undefined) {
+      await assertRefBelongsToCompany(Supplier, req.body.supplierId, subGroup.companyId, "Supplier");
+      subGroup.supplierId = req.body.supplierId;
+    }
+    if (req.body.itemNameId !== undefined) {
+      await assertRefBelongsToCompany(ItemName, req.body.itemNameId, subGroup.companyId, "Item Name");
+      subGroup.itemNameId = req.body.itemNameId;
+    }
     if (req.body.isActive !== undefined) subGroup.isActive = req.body.isActive;
 
     await subGroup.save();
@@ -102,6 +115,17 @@ const deleteItemSubGroup = async (req, res) => {
     if (!subGroup) {
       return res.status(404).json({ message: "Item Sub Group not found" });
     }
+
+    // Every sibling group controller (Customer/Supplier/Godown Group) already
+    // checks its children before hard-deleting — this one was the one
+    // outlier, hard-deleting unconditionally even though Item.itemSubGroupId
+    // is a real ref (and half of Item's own compound unique index), silently
+    // orphaning every Item that pointed at it.
+    const hasItem = await Item.exists({ companyId: subGroup.companyId, itemSubGroupId: subGroup._id });
+    if (hasItem) {
+      return res.status(400).json({ message: "Cannot delete this Sub Group — one or more Items still belong to it." });
+    }
+
     await subGroup.deleteOne();
     res.status(200).json({ message: "Item Sub Group deleted successfully" });
   } catch (error) {

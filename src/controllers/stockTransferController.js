@@ -90,7 +90,14 @@ async function assertGodownsBelongToCompany(godownIds, companyId) {
 // out), or the TO godown when called from deleteStockTransfer's reversal (reversing
 // takes stock back out of TO, which may have moved on since this transfer was made).
 // `companyId` scopes the Item lookup to prevent cross-tenant reads.
-async function assertSufficientStock(lines, checkGodownId, companyId) {
+// `isReversal` distinguishes the two genuinely different contexts this one
+// function is reused for: a forward pre-check (create's/update's "does the
+// FROM godown have enough to move OUT" — an unmatched MRP tier here means
+// the line wouldn't actually move any real stock, so it must stay blocked)
+// vs. a reversal check (update's old-pair reversal, delete — undoing a
+// transfer that was already safely applied before). Only the reversal case
+// gets the "unmatched tier" exemption — see the comment below for why.
+async function assertSufficientStock(lines, checkGodownId, companyId, { isReversal = false } = {}) {
   const neededByKey = new Map();
   const nameByKey = new Map();
   for (const line of lines) {
@@ -107,6 +114,23 @@ async function assertSufficientStock(lines, checkGodownId, companyId) {
     const matchedEntry = Array.isArray(item.mrpEntries)
       ? item.mrpEntries.find((e) => parseFloat(e.mrp) === mrp)
       : null;
+    // Mirrors purchaseController.assertSufficientStock's own exemption, but
+    // ONLY for a reversal — a line whose MRP no longer matches any real
+    // mrpEntries tier (renamed/deleted since the transfer was made) never
+    // touched a godownStock bucket at all when it was originally applied
+    // (applyStockDelta's own `if (!matchedEntry) continue;` silently no-ops
+    // for it). Without this exemption, reversing such a transfer (on
+    // delete, or on update's old-pair reversal) always read "0 pcs
+    // available" and permanently blocked it, even though nothing was
+    // actually wrong — the exact already-fixed-once bug from Purchase,
+    // reappearing here. On a forward check (isReversal=false), an unmatched
+    // tier stays blocked on purpose — applyStockDelta would silently no-op
+    // for that line, so letting the transfer through would create a record
+    // claiming to move stock that never actually moves.
+    if (!matchedEntry) {
+      if (isReversal) continue;
+      throw new Error(`Insufficient stock for "${nameByKey.get(key)}" — no matching MRP tier found on this item`);
+    }
     const bucket = matchedEntry?.godownStock?.find((g) => String(g.godownId) === String(checkGodownId));
     const available = parseFloat(bucket?.openingStockFreshPcs) || 0;
     if (available < needed) {
@@ -123,47 +147,68 @@ async function assertSufficientStock(lines, checkGodownId, companyId) {
 // are never modified, since a transfer redistributes existing stock between two
 // godowns of the same item rather than changing the company-wide total. `companyId`
 // scopes the Item lookup so a line can never mutate a different company's Item document.
-async function applyStockDelta(lines, fromGodownId, toGodownId, sign, companyId) {
-  for (const line of lines) {
-    const item = await Item.findOne({ _id: line.itemId, companyId });
-    if (!item) continue;
+async function applyOneLine(line, fromGodownId, toGodownId, sign, companyId) {
+  const item = await Item.findOne({ _id: line.itemId, companyId });
+  if (!item) return;
 
-    const matchedEntry = findMatchedRateEntry(line, item);
-    if (!matchedEntry) continue;
+  const matchedEntry = findMatchedRateEntry(line, item);
+  if (!matchedEntry) return;
 
-    const entryPacking = parseFloat(matchedEntry.packing) || 1;
-    if (!Array.isArray(matchedEntry.godownStock)) matchedEntry.godownStock = [];
+  const entryPacking = parseFloat(matchedEntry.packing) || 1;
+  if (!Array.isArray(matchedEntry.godownStock)) matchedEntry.godownStock = [];
 
-    function getOrCreateBucket(godownId) {
-      let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(godownId));
-      if (!bucket) {
-        bucket = {
-          godownId,
-          openingStockFreshCase: 0,
-          openingStockFreshPcs: 0,
-          openingStockExpiredCase: 0,
-          openingStockExpiredPcs: 0,
-          openingStockDamagedCase: 0,
-          openingStockDamagedPcs: 0,
-        };
-        matchedEntry.godownStock.push(bucket);
-        bucket = matchedEntry.godownStock[matchedEntry.godownStock.length - 1];
-      }
-      return bucket;
+  function getOrCreateBucket(godownId) {
+    let bucket = matchedEntry.godownStock.find((g) => String(g.godownId) === String(godownId));
+    if (!bucket) {
+      bucket = {
+        godownId,
+        openingStockFreshCase: 0,
+        openingStockFreshPcs: 0,
+        openingStockExpiredCase: 0,
+        openingStockExpiredPcs: 0,
+        openingStockDamagedCase: 0,
+        openingStockDamagedPcs: 0,
+      };
+      matchedEntry.godownStock.push(bucket);
+      bucket = matchedEntry.godownStock[matchedEntry.godownStock.length - 1];
     }
+    return bucket;
+  }
 
-    const fromBucket = getOrCreateBucket(fromGodownId);
-    const fromNewPcs = (parseFloat(fromBucket.openingStockFreshPcs) || 0) - sign * line.totalPieces;
-    fromBucket.openingStockFreshPcs = fromNewPcs;
-    fromBucket.openingStockFreshCase = entryPacking > 0 ? fromNewPcs / entryPacking : fromNewPcs;
+  const fromBucket = getOrCreateBucket(fromGodownId);
+  const fromNewPcs = (parseFloat(fromBucket.openingStockFreshPcs) || 0) - sign * line.totalPieces;
+  fromBucket.openingStockFreshPcs = fromNewPcs;
+  fromBucket.openingStockFreshCase = entryPacking > 0 ? fromNewPcs / entryPacking : fromNewPcs;
 
-    const toBucket = getOrCreateBucket(toGodownId);
-    const toNewPcs = (parseFloat(toBucket.openingStockFreshPcs) || 0) + sign * line.totalPieces;
-    toBucket.openingStockFreshPcs = toNewPcs;
-    toBucket.openingStockFreshCase = entryPacking > 0 ? toNewPcs / entryPacking : toNewPcs;
+  const toBucket = getOrCreateBucket(toGodownId);
+  const toNewPcs = (parseFloat(toBucket.openingStockFreshPcs) || 0) + sign * line.totalPieces;
+  toBucket.openingStockFreshPcs = toNewPcs;
+  toBucket.openingStockFreshCase = entryPacking > 0 ? toNewPcs / entryPacking : toNewPcs;
 
-    item.markModified("mrpEntries");
-    await item.save();
+  item.markModified("mrpEntries");
+  await item.save();
+}
+
+// Self-healing against a partial mid-loop failure — see purchaseController's
+// identical helper for the full rationale. A single line's "move" is one
+// atomic FROM-decrement + TO-increment pair, so reversing it is just the
+// same line/from/to with the opposite sign.
+async function applyStockDelta(lines, fromGodownId, toGodownId, sign, companyId) {
+  const applied = [];
+  try {
+    for (const line of lines) {
+      await applyOneLine(line, fromGodownId, toGodownId, sign, companyId);
+      applied.push(line);
+    }
+  } catch (err) {
+    for (let i = applied.length - 1; i >= 0; i--) {
+      try {
+        await applyOneLine(applied[i], fromGodownId, toGodownId, -sign, companyId);
+      } catch (rollbackErr) {
+        console.error("applyStockDelta: failed to roll back a partially-applied line — stock may be desynced", rollbackErr);
+      }
+    }
+    throw err;
   }
 }
 
@@ -306,7 +351,7 @@ const updateStockTransfer = async (req, res) => {
     // pattern as Sale/the Return controllers. The old TO godown's stock may have
     // already moved on via a downstream Sale/transfer since this was created, so
     // check it has enough before reversing (mirrors deleteStockTransfer's own guard).
-    await assertSufficientStock(oldItems, oldToGodownId, companyId);
+    await assertSufficientStock(oldItems, oldToGodownId, companyId, { isReversal: true });
     await applyStockDelta(oldItems, oldFromGodownId, oldToGodownId, -1, companyId);
 
     try {
@@ -349,7 +394,7 @@ const deleteStockTransfer = async (req, res) => {
     // stock may have moved on via a downstream Sale/transfer since this was created,
     // so check TO has enough before reversing (mirrors purchaseController's pattern
     // of checking before a reversal that removes stock).
-    await assertSufficientStock(transfer.items, transfer.toGodownId, transfer.companyId);
+    await assertSufficientStock(transfer.items, transfer.toGodownId, transfer.companyId, { isReversal: true });
     await applyStockDelta(transfer.items, transfer.fromGodownId, transfer.toGodownId, -1, transfer.companyId);
     await transfer.deleteOne();
 

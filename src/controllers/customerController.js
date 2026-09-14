@@ -4,8 +4,10 @@ const Sale = require("../models/Sale");
 const SaleReturn = require("../models/SaleReturn");
 const OpeningBill = require("../models/OpeningBill");
 const Scheme = require("../models/Scheme");
+const CustomerGroup = require("../models/CustomerGroup");
+const Salesman = require("../models/Salesman");
 const { sendError } = require("../utils/errorHandler");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 // A customer with `creditDays` unset/0 has no configured due-date policy at
 // all, so "overdue" has no meaning for them — never flagged, matching the
@@ -143,6 +145,10 @@ const createCustomer = async (req, res) => {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
+    // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
+    await assertRefBelongsToCompany(CustomerGroup, customerGroupId, companyId, "Customer Group");
+    await assertRefBelongsToCompany(Salesman, salesmanId, companyId, "Salesman");
+
     const customerExists = await Customer.findOne({ companyId, name });
     if (customerExists) {
       return res.status(400).json({ message: "Customer already exists in this company" });
@@ -216,8 +222,14 @@ const updateCustomer = async (req, res) => {
     if (drugLicNo !== undefined) customer.drugLicNo = drugLicNo.trim() || "";
     if (customerType !== undefined) customer.customerType = customerType.trim() || "";
     if (balanceMethod !== undefined) customer.balanceMethod = balanceMethod.trim() || "";
-    if (salesmanId !== undefined) customer.salesmanId = salesmanId || null;
-    if (customerGroupId !== undefined) customer.customerGroupId = customerGroupId;
+    if (salesmanId !== undefined) {
+      await assertRefBelongsToCompany(Salesman, salesmanId, customer.companyId, "Salesman");
+      customer.salesmanId = salesmanId || null;
+    }
+    if (customerGroupId !== undefined) {
+      await assertRefBelongsToCompany(CustomerGroup, customerGroupId, customer.companyId, "Customer Group");
+      customer.customerGroupId = customerGroupId;
+    }
     if (routeNo !== undefined) customer.routeNo = routeNo.trim() || "";
     if (zoneNo !== undefined) customer.zoneNo = zoneNo.trim() || "";
     if (creditLimit !== undefined) customer.creditLimit = parseFloat(creditLimit) || 0;

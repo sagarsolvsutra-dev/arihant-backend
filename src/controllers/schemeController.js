@@ -1,5 +1,6 @@
 const Scheme = require("../models/Scheme");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const Customer = require("../models/Customer");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 const getSchemes = async (req, res) => {
   try {
@@ -53,6 +54,11 @@ const createScheme = async (req, res) => {
       return res.status(400).json({ message: "companyId is required" });
     }
 
+    // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
+    // itemGroupId is deliberately NOT validated here — it's a known dangling ref
+    // pointing at a model (ItemGroup) that no longer exists in this codebase.
+    await assertRefBelongsToCompany(Customer, customerId, companyId, "Customer");
+
     const scheme = await Scheme.create({
       companyId,
       itemGroupId: itemGroupId || null,
@@ -79,7 +85,10 @@ const updateScheme = async (req, res) => {
     } = req.body;
 
     if (itemGroupId !== undefined) scheme.itemGroupId = itemGroupId || null;
-    if (customerId !== undefined) scheme.customerId = customerId || null;
+    if (customerId !== undefined) {
+      await assertRefBelongsToCompany(Customer, customerId, scheme.companyId, "Customer");
+      scheme.customerId = customerId || null;
+    }
     if (lessPercentage !== undefined) scheme.lessPercentage = parseFloat(lessPercentage) || 0;
     if (cdPercentage !== undefined) scheme.cdPercentage = parseFloat(cdPercentage) || 0;
 

@@ -1,6 +1,9 @@
 const OpeningBill = require("../models/OpeningBill");
 const Customer = require("../models/Customer");
+const Supplier = require("../models/Supplier");
+const Salesman = require("../models/Salesman");
 const { sendError } = require("../utils/errorHandler");
+const { assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 const getOpeningBills = async (req, res) => {
   try {
@@ -30,6 +33,18 @@ const createOpeningBill = async (req, res) => {
 
     if (!companyId || !type || !billNo || !billDate || totalAmount === undefined) {
       return res.status(400).json({ message: "Please provide all required fields" });
+    }
+
+    // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
+    await assertRefBelongsToCompany(Customer, customerId, companyId, "Customer");
+    await assertRefBelongsToCompany(Supplier, supplierId, companyId, "Supplier");
+    await assertRefBelongsToCompany(Salesman, salesmanId, companyId, "Salesman");
+
+    if (parseFloat(totalAmount) < 0) {
+      throw new Error("Total Amount cannot be negative");
+    }
+    if (pendingAmount !== undefined && parseFloat(pendingAmount) < 0) {
+      throw new Error("Pending Amount cannot be negative");
     }
 
     const billExists = await OpeningBill.findOne({ companyId, type, billNo });
@@ -82,17 +97,32 @@ const updateOpeningBill = async (req, res) => {
     }
 
     if (bill.type === "sale") {
-      if (customerId !== undefined) bill.customerId = customerId;
+      if (customerId !== undefined) {
+        await assertRefBelongsToCompany(Customer, customerId, bill.companyId, "Customer");
+        bill.customerId = customerId;
+      }
       if (taxInvoice !== undefined) bill.taxInvoice = taxInvoice.trim();
       if (dueDate !== undefined) bill.dueDate = dueDate;
-      if (salesmanId !== undefined) bill.salesmanId = salesmanId;
+      if (salesmanId !== undefined) {
+        await assertRefBelongsToCompany(Salesman, salesmanId, bill.companyId, "Salesman");
+        bill.salesmanId = salesmanId;
+      }
     } else if (bill.type === "purchase") {
-      if (supplierId !== undefined) bill.supplierId = supplierId;
+      if (supplierId !== undefined) {
+        await assertRefBelongsToCompany(Supplier, supplierId, bill.companyId, "Supplier");
+        bill.supplierId = supplierId;
+      }
     }
 
     if (billDate !== undefined) bill.billDate = billDate;
-    if (totalAmount !== undefined) bill.totalAmount = parseFloat(totalAmount) || 0;
-    if (pendingAmount !== undefined) bill.pendingAmount = parseFloat(pendingAmount) || 0;
+    if (totalAmount !== undefined) {
+      if (parseFloat(totalAmount) < 0) throw new Error("Total Amount cannot be negative");
+      bill.totalAmount = parseFloat(totalAmount) || 0;
+    }
+    if (pendingAmount !== undefined) {
+      if (parseFloat(pendingAmount) < 0) throw new Error("Pending Amount cannot be negative");
+      bill.pendingAmount = parseFloat(pendingAmount) || 0;
+    }
     if (notes !== undefined) bill.notes = notes.trim() || "";
 
     await bill.save();

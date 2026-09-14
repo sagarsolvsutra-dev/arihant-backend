@@ -5,8 +5,9 @@ const Sale = require("../models/Sale");
 const PurchaseReturn = require("../models/PurchaseReturn");
 const SaleReturn = require("../models/SaleReturn");
 const StockTransfer = require("../models/StockTransfer");
+const GodownGroup = require("../models/GodownGroup");
 const { sendError } = require("../utils/errorHandler");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
 const getGodowns = async (req, res) => {
   try {
@@ -55,6 +56,9 @@ const createGodown = async (req, res) => {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
 
+    // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
+    await assertRefBelongsToCompany(GodownGroup, godownGroupId, companyId, "Godown Group");
+
     const exists = await Godown.findOne({ companyId, name, godownGroupId: godownGroupId || null });
     if (exists) {
       return res.status(400).json({ message: "A godown with this name already exists in this Group" });
@@ -99,7 +103,10 @@ const updateGodown = async (req, res) => {
       }
     }
     if (name !== undefined) godown.name = name.trim();
-    if (godownGroupId !== undefined) godown.godownGroupId = godownGroupId || null;
+    if (godownGroupId !== undefined) {
+      await assertRefBelongsToCompany(GodownGroup, godownGroupId, godown.companyId, "Godown Group");
+      godown.godownGroupId = godownGroupId || null;
+    }
     if (isActive !== undefined) godown.isActive = isActive;
 
     await godown.save();
