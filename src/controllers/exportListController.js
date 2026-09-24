@@ -1,4 +1,5 @@
 const ExcelJS = require("exceljs");
+const PDFDocument = require("pdfkit");
 const Supplier = require("../models/Supplier");
 const SupplierGroup = require("../models/SupplierGroup");
 const GodownGroup = require("../models/GodownGroup");
@@ -296,6 +297,88 @@ function addExcelSheet(workbook, sheetName, columns, records) {
   }
 }
 
+async function sendPdfFile(res, title, columns, records, filename) {
+  const doc = new PDFDocument({ margin: 40, size: "A4", layout: "landscape" });
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  doc.pipe(res);
+
+  doc.fontSize(16).fillColor("#000").text(title);
+  doc.fontSize(9).fillColor("#666").text(`Generated ${new Date().toLocaleString("en-IN")}`);
+  let y = doc.y + 16;
+  
+  const startX = doc.page.margins.left;
+  const totalWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const rowHeight = 20;
+
+  const totalColsWidth = columns.reduce((s, c) => s + c.width, 0);
+  const scale = totalWidth / totalColsWidth;
+
+  function drawHeaderRow() {
+    let x = startX;
+    doc.rect(startX, y, totalWidth, rowHeight).fill("#111111");
+    doc.fillColor("#fff").fontSize(9);
+    columns.forEach((c) => {
+      const w = c.width * scale;
+      doc.text(c.header, x + 4, y + 6, { width: w - 8, align: c.align || "left" });
+      x += w;
+    });
+    y += rowHeight;
+  }
+
+  drawHeaderRow();
+
+  if (records.length === 0) {
+    doc.fillColor("#888").fontSize(8.5).text("No records.", startX + 4, y + 4);
+    y += rowHeight;
+  }
+
+  records.forEach((r, idx) => {
+    if (y + rowHeight > doc.page.height - doc.page.margins.bottom) {
+      doc.addPage();
+      y = doc.page.margins.top;
+      drawHeaderRow();
+    }
+    if (idx % 2 === 1) {
+      doc.rect(startX, y, totalWidth, rowHeight).fill("#f5f5f5");
+    }
+    let x = startX;
+    doc.fillColor("#000").fontSize(8.5);
+    columns.forEach((c) => {
+      const w = c.width * scale;
+      let val = c.accessor(r);
+      if (c.moneyCol) val = `Rs.${Number(val || 0).toFixed(2)}`;
+      doc.text(String(val ?? "-"), x + 4, y + 6, { width: w - 8, align: c.align || "left" });
+      x += w;
+    });
+    y += rowHeight;
+  });
+
+  const moneyCols = columns.map((c, i) => (c.moneyCol ? i : -1)).filter((i) => i >= 0);
+  if (moneyCols.length > 0 && records.length > 0) {
+    if (y + rowHeight > doc.page.height - doc.page.margins.bottom) {
+      doc.addPage();
+      y = doc.page.margins.top;
+    }
+    doc.rect(startX, y, totalWidth, rowHeight).fill("#e5e5e5");
+    doc.fillColor("#000").fontSize(9).font("Helvetica-Bold");
+    let x = startX;
+    columns.forEach((c, i) => {
+      const w = c.width * scale;
+      if (i === 0) {
+        doc.text("TOTAL", x + 4, y + 6, { width: w - 8 });
+      } else if (c.moneyCol) {
+        const totalVal = records.reduce((s, rec) => s + (c.accessor(rec) || 0), 0);
+        doc.text(`Rs.${Number(totalVal).toFixed(2)}`, x + 4, y + 6, { width: w - 8, align: "right" });
+      }
+      x += w;
+    });
+    y += rowHeight;
+  }
+
+  doc.end();
+}
+
 // GET /api/export-list/:resource?companyId=&dateFrom=&dateTo=&search=
 const exportList = async (req, res) => {
   try {
@@ -328,14 +411,19 @@ const exportList = async (req, res) => {
     const sortField = config.dateField || "createdAt";
     const records = await query.sort({ [sortField]: -1 }).limit(10000).lean();
 
-    const workbook = new ExcelJS.Workbook();
-    addExcelSheet(workbook, config.label, config.columns, records);
-
+    const format = req.query.format || "excel";
     const safeName = config.label.replace(/[^a-z0-9]+/gi, "_");
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="${safeName}.xlsx"`);
-    await workbook.xlsx.write(res);
-    res.end();
+    
+    if (format === "pdf") {
+      await sendPdfFile(res, config.label, config.columns, records, `${safeName}.pdf`);
+    } else {
+      const workbook = new ExcelJS.Workbook();
+      addExcelSheet(workbook, config.label, config.columns, records);
+      res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeName}.xlsx"`);
+      await workbook.xlsx.write(res);
+      res.end();
+    }
   } catch (error) {
     console.error(error);
     if (!res.headersSent) {

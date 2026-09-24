@@ -62,6 +62,18 @@ const CustomerSchema = new mongoose.Schema(
       uppercase: true,
       trim: true,
     },
+    fssaiLicenseNumber: {
+      type: String,
+      default: "",
+    },
+    fssaiIssueDate: {
+      type: Date,
+      default: null,
+    },
+    fssaiExpiryDate: {
+      type: Date,
+      default: null,
+    },
     customerGroupId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "CustomerGroup",

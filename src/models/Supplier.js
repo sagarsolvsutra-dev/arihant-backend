@@ -66,6 +66,18 @@ const SupplierSchema = new mongoose.Schema(
       uppercase: true,
       trim: true,
     },
+    fssaiLicenseNumber: {
+      type: String,
+      default: "",
+    },
+    fssaiIssueDate: {
+      type: Date,
+      default: null,
+    },
+    fssaiExpiryDate: {
+      type: Date,
+      default: null,
+    },
     supplierGroupId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "SupplierGroup",

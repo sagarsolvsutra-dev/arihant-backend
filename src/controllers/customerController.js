@@ -138,7 +138,7 @@ const createCustomer = async (req, res) => {
   try {
     const {
       companyId, name, alias, contactPerson, mobile, phone, email, address, city, state, pincode,
-      gstNo, panNo, uniqueIdNo, drugLicNo, customerType, balanceMethod, salesmanId, customerGroupId, routeNo, zoneNo, creditLimit, creditDays, isActive,
+      gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, uniqueIdNo, drugLicNo, customerType, balanceMethod, salesmanId, customerGroupId, routeNo, zoneNo, creditLimit, creditDays, isActive,
     } = req.body;
 
     if (!companyId || !name) {
@@ -168,6 +168,9 @@ const createCustomer = async (req, res) => {
       pincode: pincode?.trim() || "",
       gstNo: gstNo?.trim() || "",
       panNo: panNo?.trim() || "",
+      fssaiLicenseNumber: fssaiLicenseNumber?.trim() || "",
+      fssaiIssueDate: fssaiIssueDate || null,
+      fssaiExpiryDate: fssaiExpiryDate || null,
       uniqueIdNo: uniqueIdNo?.trim() || "",
       drugLicNo: drugLicNo?.trim() || "",
       customerType: customerType?.trim() || "Retailer",
@@ -196,7 +199,7 @@ const updateCustomer = async (req, res) => {
 
     const {
       name, alias, contactPerson, mobile, phone, email, address, city, state, pincode,
-      gstNo, panNo, uniqueIdNo, drugLicNo, customerType, balanceMethod, salesmanId, customerGroupId, routeNo, zoneNo, creditLimit, creditDays, isActive,
+      gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, uniqueIdNo, drugLicNo, customerType, balanceMethod, salesmanId, customerGroupId, routeNo, zoneNo, creditLimit, creditDays, isActive,
     } = req.body;
 
     if (name) {
@@ -218,6 +221,9 @@ const updateCustomer = async (req, res) => {
     if (pincode !== undefined) customer.pincode = pincode.trim() || "";
     if (gstNo !== undefined) customer.gstNo = gstNo.trim() || "";
     if (panNo !== undefined) customer.panNo = panNo.trim() || "";
+    if (fssaiLicenseNumber !== undefined) customer.fssaiLicenseNumber = fssaiLicenseNumber.trim() || "";
+    if (fssaiIssueDate !== undefined) customer.fssaiIssueDate = fssaiIssueDate || null;
+    if (fssaiExpiryDate !== undefined) customer.fssaiExpiryDate = fssaiExpiryDate || null;
     if (uniqueIdNo !== undefined) customer.uniqueIdNo = uniqueIdNo.trim() || "";
     if (drugLicNo !== undefined) customer.drugLicNo = drugLicNo.trim() || "";
     if (customerType !== undefined) customer.customerType = customerType.trim() || "";

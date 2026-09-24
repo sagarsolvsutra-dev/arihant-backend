@@ -67,7 +67,7 @@ const createSupplier = async (req, res) => {
   try {
     const {
       companyId, name, alias, phone, phone2, mobile, contactPerson, email, address, city, state, pincode,
-      gstNo, panNo, supplierGroupId, balanceMethod, creditDays, isActive,
+      gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, supplierGroupId, balanceMethod, creditDays, isActive,
     } = req.body;
 
     if (!companyId || !name) {
@@ -97,6 +97,9 @@ const createSupplier = async (req, res) => {
       pincode: pincode?.trim() || "",
       gstNo: gstNo?.trim() || "",
       panNo: panNo?.trim() || "",
+      fssaiLicenseNumber: fssaiLicenseNumber?.trim() || "",
+      fssaiIssueDate: fssaiIssueDate || null,
+      fssaiExpiryDate: fssaiExpiryDate || null,
       supplierGroupId,
       balanceMethod: balanceMethod || "Bill by bill",
       creditDays: parseInt(creditDays) || 0,
@@ -118,7 +121,7 @@ const updateSupplier = async (req, res) => {
 
     const {
       name, alias, phone, phone2, mobile, contactPerson, email, address, city, state, pincode,
-      gstNo, panNo, supplierGroupId, balanceMethod, creditDays, isActive,
+      gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, supplierGroupId, balanceMethod, creditDays, isActive,
     } = req.body;
 
     if (name) {
@@ -141,6 +144,9 @@ const updateSupplier = async (req, res) => {
     if (pincode !== undefined) supplier.pincode = pincode.trim() || "";
     if (gstNo !== undefined) supplier.gstNo = gstNo.trim() || "";
     if (panNo !== undefined) supplier.panNo = panNo.trim() || "";
+    if (fssaiLicenseNumber !== undefined) supplier.fssaiLicenseNumber = fssaiLicenseNumber.trim() || "";
+    if (fssaiIssueDate !== undefined) supplier.fssaiIssueDate = fssaiIssueDate || null;
+    if (fssaiExpiryDate !== undefined) supplier.fssaiExpiryDate = fssaiExpiryDate || null;
     if (supplierGroupId !== undefined) {
       await assertRefBelongsToCompany(SupplierGroup, supplierGroupId, supplier.companyId, "Supplier Group");
       supplier.supplierGroupId = supplierGroupId;

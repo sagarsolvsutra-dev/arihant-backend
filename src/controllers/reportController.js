@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const ExcelJS = require("exceljs");
+const PDFDocument = require("pdfkit");
 const Item = require("../models/Item");
 const Customer = require("../models/Customer");
 const Supplier = require("../models/Supplier");
@@ -59,6 +60,66 @@ async function sendExcelFile(res, sheetName, columns, records, filename) {
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   await workbook.xlsx.write(res);
   res.end();
+}
+
+async function sendPdfFile(res, title, columns, records, filename) {
+  const doc = new PDFDocument({ margin: 40, size: "A4", layout: "portrait" });
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  doc.pipe(res);
+
+  doc.fontSize(16).fillColor("#000").text(title);
+  doc.fontSize(9).fillColor("#666").text(`Generated ${new Date().toLocaleString("en-IN")}`);
+  let y = doc.y + 16;
+  
+  const startX = doc.page.margins.left;
+  const totalWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const rowHeight = 20;
+
+  const totalColsWidth = columns.reduce((s, c) => s + c.width, 0);
+  const scale = totalWidth / totalColsWidth;
+
+  function drawHeaderRow() {
+    let x = startX;
+    doc.rect(startX, y, totalWidth, rowHeight).fill("#111111");
+    doc.fillColor("#fff").fontSize(9);
+    columns.forEach((c) => {
+      const w = c.width * scale;
+      doc.text(c.header, x + 4, y + 6, { width: w - 8, align: c.align || "left" });
+      x += w;
+    });
+    y += rowHeight;
+  }
+
+  drawHeaderRow();
+
+  if (records.length === 0) {
+    doc.fillColor("#888").fontSize(8.5).text("No records.", startX + 4, y + 4);
+    y += rowHeight;
+  }
+
+  records.forEach((r, idx) => {
+    if (y + rowHeight > doc.page.height - doc.page.margins.bottom) {
+      doc.addPage();
+      y = doc.page.margins.top;
+      drawHeaderRow();
+    }
+    if (idx % 2 === 1) {
+      doc.rect(startX, y, totalWidth, rowHeight).fill("#f5f5f5");
+    }
+    let x = startX;
+    doc.fillColor("#000").fontSize(8.5);
+    columns.forEach((c) => {
+      const w = c.width * scale;
+      let val = c.accessor(r);
+      if (c.moneyCol) val = `Rs.${Number(val || 0).toFixed(2)}`;
+      doc.text(String(val ?? "-"), x + 4, y + 6, { width: w - 8, align: c.align || "left" });
+      x += w;
+    });
+    y += rowHeight;
+  });
+
+  doc.end();
 }
 
 function fmtDate(d) {
@@ -1530,7 +1591,12 @@ const exportCustomerLedger = async (req, res) => {
     const rows = ledgerExcelRows(ledger, dateFrom, true);
     const safeName = loaded.party.name.replace(/[^a-z0-9]+/gi, "_");
 
-    await sendExcelFile(res, "Customer Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);
+    const format = req.query.format || "excel";
+    if (format === "pdf") {
+      await sendPdfFile(res, `Customer Ledger: ${loaded.party.name}`, ledgerExcelColumns(), rows, `${safeName}_Ledger.pdf`);
+    } else {
+      await sendExcelFile(res, "Customer Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);
+    }
   } catch (error) {
     sendExportError(res, error);
   }
@@ -1557,7 +1623,12 @@ const exportSupplierLedger = async (req, res) => {
     const rows = ledgerExcelRows(ledger, dateFrom, false);
     const safeName = loaded.party.name.replace(/[^a-z0-9]+/gi, "_");
 
-    await sendExcelFile(res, "Supplier Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);
+    const format = req.query.format || "excel";
+    if (format === "pdf") {
+      await sendPdfFile(res, `Supplier Ledger: ${loaded.party.name}`, ledgerExcelColumns(), rows, `${safeName}_Ledger.pdf`);
+    } else {
+      await sendExcelFile(res, "Supplier Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);
+    }
   } catch (error) {
     sendExportError(res, error);
   }
