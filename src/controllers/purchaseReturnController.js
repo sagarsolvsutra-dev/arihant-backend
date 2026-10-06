@@ -2,7 +2,10 @@ const PurchaseReturn = require("../models/PurchaseReturn");
 const Purchase = require("../models/Purchase");
 const Item = require("../models/Item");
 const Godown = require("../models/Godown");
+const Payment = require("../models/Payment");
+const BankAccount = require("../models/BankAccount");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const { usesBankAccount } = require("../utils/paymentModes");
 
 // Identical to purchaseController.findMatchedRateEntry — MRP is the identity key.
 function findMatchedRateEntry(raw, item) {
@@ -33,6 +36,12 @@ function computeLine(raw, item) {
     lessPercent < 0 || cdPercent < 0 || gstPercent < 0 || gstPercent > 100
   ) {
     throw new Error(`Quantities and rates cannot be negative (item: ${item.itemName})`);
+  }
+  // Case/Pcs/Free Qty are discrete piece counts — a fractional value was
+  // previously accepted silently and would carry a floating-point remainder
+  // through totalPieces/stock into the Item's stored pcs fields.
+  if (!Number.isInteger(caseQty) || !Number.isInteger(pcsQty) || !Number.isInteger(freeQty)) {
+    throw new Error(`Case, Pcs, and Free Qty must be whole numbers (item: ${item.itemName})`);
   }
   if (caseQty === 0 && pcsQty === 0) {
     throw new Error(`Enter a Case or Pcs quantity greater than 0 (item: ${item.itemName})`);
@@ -214,6 +223,60 @@ async function assertSufficientStock(lines, companyId) {
   }
 }
 
+// Reverses the auto-created refund Payment record (+ its BankAccount effect)
+// for one invoice, if one exists — matched via `allocations`. Safe to call
+// even when none exists. Shared by updatePurchaseReturn and
+// deletePurchaseReturn. See purchaseController's identical helper.
+async function reverseInvoicePayment(invoiceId, invoiceType, companyId) {
+  const existing = await Payment.findOne({
+    companyId,
+    "allocations.invoiceId": invoiceId,
+    "allocations.invoiceType": invoiceType,
+  });
+  if (!existing) return;
+  // Reversal is driven by the stored Payment, so it always undoes exactly what
+  // was applied. The `existing.bankAccountId` half is what keeps records written
+  // before Cheque/UPI moved the bank safe: those carry a null bankAccountId and
+  // never debited anything, so they must not be credited back now.
+  if (usesBankAccount(existing.paymentMode) && existing.bankAccountId) {
+    await BankAccount.findByIdAndUpdate(existing.bankAccountId, {
+      $inc: { currentBalance: existing.paymentType === "Pay" ? existing.amount : -existing.amount },
+    });
+  }
+  await Payment.deleteOne({ _id: existing._id });
+}
+
+// Creates a fresh refund Payment record (+ its BankAccount effect) for one
+// invoice. Mirrors createPurchaseReturn's own inline block, extracted so
+// updatePurchaseReturn can reuse it identically.
+async function createInvoicePayment({ companyId, invoiceId, invoiceType, invoiceNo, date, partyType, partyId, paymentType, paymentMode, bankAccountId, amount, noteVerb }) {
+  if (!(amount > 0)) return;
+  if (usesBankAccount(paymentMode) && bankAccountId) {
+    const bank = await BankAccount.findById(bankAccountId);
+    if (!bank) throw new Error("Bank account not found");
+    if (paymentType === "Pay") {
+      if ((bank.currentBalance || 0) < amount) {
+        throw new Error("Insufficient balance in selected Bank Account");
+      }
+      await BankAccount.findByIdAndUpdate(bankAccountId, { $inc: { currentBalance: -amount } });
+    } else {
+      await BankAccount.findByIdAndUpdate(bankAccountId, { $inc: { currentBalance: amount } });
+    }
+  }
+  await Payment.create({
+    companyId,
+    paymentDate: date,
+    paymentType,
+    partyType,
+    partyId: partyId || null,
+    paymentMode: paymentMode || "Cash",
+    bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
+    amount,
+    notes: `${noteVerb} ${invoiceType} ${invoiceNo}`,
+    allocations: [{ invoiceId, invoiceType, allocatedAmount: amount }],
+  });
+}
+
 // sign = -1 to apply a purchase return's stock effect (decrement), +1 to reverse it.
 // Same non-destructive per-godown-bucket upsert as Purchase/Sale's applyStockDelta,
 // but deliberately does NOT touch lastCostRate/purchaseRate — those are purchase-
@@ -373,6 +436,8 @@ const createPurchaseReturn = async (req, res) => {
       items,
       refundAmount,
       dueDate,
+      paymentMode,
+      bankAccountId,
     } = req.body;
 
     if (!companyId || !returnNo || !returnDate || !supplierId) {
@@ -407,14 +472,39 @@ const createPurchaseReturn = async (req, res) => {
       ...totals,
       refundAmount: refund,
       pendingAmount: totals.netAmount - refund,
+      paymentMode,
+      bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
       dueDate: dueDate || null,
     });
 
+    // Payment creation and the stock effect are both wrapped in the SAME try/catch —
+    // a failure in either one must delete the just-created PurchaseReturn and reverse
+    // whatever refund-payment effect was already applied. See purchaseController's
+    // identical fix for the real orphaned-document bug this closes (confirmed live:
+    // an earlier version here left an orphaned PurchaseReturn behind when the Payment
+    // model's invoiceType enum mismatch made createInvoicePayment throw).
     try {
+      if (refund > 0) {
+        await createInvoicePayment({
+          companyId,
+          invoiceId: purchaseReturn._id,
+          invoiceType: "PurchaseReturn",
+          invoiceNo: returnNo,
+          date: returnDate,
+          partyType: "Supplier",
+          partyId: supplierId,
+          paymentType: "Receive",
+          paymentMode,
+          bankAccountId,
+          amount: refund,
+          noteVerb: "Refund for",
+        });
+      }
       await applyStockDelta(lines, -1, companyId);
-    } catch (stockErr) {
+    } catch (err) {
       await PurchaseReturn.deleteOne({ _id: purchaseReturn._id });
-      throw stockErr;
+      await reverseInvoicePayment(purchaseReturn._id, "PurchaseReturn", companyId);
+      throw err;
     }
 
     res.status(201).json(purchaseReturn);
@@ -433,6 +523,12 @@ const updatePurchaseReturn = async (req, res) => {
     // Captured before any mutation — see saleController.updateSale for why the
     // rollback path must use this snapshot, not `purchaseReturn.items` (reassigned below).
     const oldItems = purchaseReturn.items;
+    const oldRefundAmount = purchaseReturn.refundAmount;
+    const oldPaymentMode = purchaseReturn.paymentMode;
+    const oldBankAccountId = purchaseReturn.bankAccountId;
+    const oldSupplierId = purchaseReturn.supplierId;
+    const oldReturnNo = purchaseReturn.returnNo;
+    const oldReturnDate = purchaseReturn.returnDate;
 
     const {
       returnNo,
@@ -444,6 +540,8 @@ const updatePurchaseReturn = async (req, res) => {
       items,
       refundAmount,
       dueDate,
+      paymentMode,
+      bankAccountId,
     } = req.body;
 
     if (returnNo && returnNo.trim() !== purchaseReturn.returnNo) {
@@ -462,6 +560,10 @@ const updatePurchaseReturn = async (req, res) => {
     // stock never ends up partially mutated. Each old line already carries its own
     // godownId, so this reverses each line against its own godown.
     await applyStockDelta(oldItems, 1, companyId);
+    // Reverse whatever refund-payment effect the OLD refund amount applied — the
+    // (possibly unchanged) new amount is re-applied below once the rest of the
+    // update succeeds, same reverse-then-reapply shape as the stock line above.
+    await reverseInvoicePayment(purchaseReturn._id, "PurchaseReturn", companyId);
 
     try {
       const lines = await buildLines(items || oldItems, companyId);
@@ -482,9 +584,12 @@ const updatePurchaseReturn = async (req, res) => {
       purchaseReturn.items = lines;
       Object.assign(purchaseReturn, totals);
 
-      const refund = refundAmount !== undefined ? parseFloat(refundAmount) || 0 : purchaseReturn.refundAmount;
+      const refund = refundAmount !== undefined ? parseFloat(refundAmount) || 0 : oldRefundAmount;
       purchaseReturn.refundAmount = refund;
       purchaseReturn.pendingAmount = totals.netAmount - refund;
+      if (paymentMode !== undefined) purchaseReturn.paymentMode = paymentMode;
+      if (usesBankAccount(paymentMode)) purchaseReturn.bankAccountId = bankAccountId;
+      else if (paymentMode) purchaseReturn.bankAccountId = null;
       if (dueDate !== undefined) purchaseReturn.dueDate = dueDate || null;
 
       // Field mutation + save + reapply must all succeed together, or the reversal
@@ -492,8 +597,41 @@ const updatePurchaseReturn = async (req, res) => {
       // this closes (a `.save()`-time validation error leaving stock desynced).
       await purchaseReturn.save();
       await applyStockDelta(lines, -1, companyId);
+
+      if (refund > 0) {
+        await createInvoicePayment({
+          companyId,
+          invoiceId: purchaseReturn._id,
+          invoiceType: "PurchaseReturn",
+          invoiceNo: purchaseReturn.returnNo,
+          date: purchaseReturn.returnDate,
+          partyType: "Supplier",
+          partyId: purchaseReturn.supplierId,
+          paymentType: "Receive",
+          paymentMode: purchaseReturn.paymentMode,
+          bankAccountId: purchaseReturn.bankAccountId,
+          amount: refund,
+          noteVerb: "Refund for",
+        });
+      }
     } catch (err) {
       await applyStockDelta(oldItems, -1, companyId);
+      if (oldRefundAmount > 0) {
+        await createInvoicePayment({
+          companyId,
+          invoiceId: purchaseReturn._id,
+          invoiceType: "PurchaseReturn",
+          invoiceNo: oldReturnNo,
+          date: oldReturnDate,
+          partyType: "Supplier",
+          partyId: oldSupplierId,
+          paymentType: "Receive",
+          paymentMode: oldPaymentMode,
+          bankAccountId: oldBankAccountId,
+          amount: oldRefundAmount,
+          noteVerb: "Refund for",
+        }).catch(() => {});
+      }
       throw err;
     }
 
@@ -511,6 +649,7 @@ const deletePurchaseReturn = async (req, res) => {
     }
 
     await applyStockDelta(purchaseReturn.items, 1, purchaseReturn.companyId);
+    await reverseInvoicePayment(purchaseReturn._id, "PurchaseReturn", purchaseReturn.companyId);
     await purchaseReturn.deleteOne();
 
     res.status(200).json({ message: "Purchase Return deleted successfully" });

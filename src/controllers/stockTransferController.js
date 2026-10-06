@@ -23,6 +23,9 @@ function computeLine(raw, item) {
   if (caseQty < 0 || pcsQty < 0) {
     throw new Error(`Quantities cannot be negative (item: ${item.itemName})`);
   }
+  if (!Number.isInteger(caseQty) || !Number.isInteger(pcsQty)) {
+    throw new Error(`Case and Pcs must be whole numbers (item: ${item.itemName})`);
+  }
   if (caseQty === 0 && pcsQty === 0) {
     throw new Error(`Enter a Case or Pcs quantity greater than 0 (item: ${item.itemName})`);
   }

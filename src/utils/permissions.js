@@ -41,6 +41,8 @@ const PERMISSION_MODULES = [
   "salesmen",
   "schemes",
   "openingBills",
+  "bankAccounts",
+  "payments",
 ];
 
 const PERMISSION_ACTIONS = ["view", "create", "edit", "delete"];
@@ -68,6 +70,8 @@ const MODULE_ACTIONS = {
   salesmen: ["view", "create", "edit", "delete"],
   schemes: ["view", "create", "edit", "delete"],
   openingBills: ["view", "create", "edit", "delete"],
+  bankAccounts: ["view", "create", "edit", "delete"],
+  payments: ["view", "create", "edit", "delete"],
 };
 
 const PERMISSION_LABELS = {
@@ -90,6 +94,8 @@ const PERMISSION_LABELS = {
   salesmen: "Salesmen",
   schemes: "Schemes",
   openingBills: "Opening Bills",
+  bankAccounts: "Bank Accounts",
+  payments: "Payment Receiver",
 };
 
 // Strips anything that isn't a real module/action pair out of a client-

@@ -117,6 +117,7 @@ app.use("/api/suppliers", protect, scopeCompany, requirePermission("suppliers", 
 app.use("/api/salesmen", protect, scopeCompany, requirePermission("salesmen", { readOnly: true }), require("./routes/salesmanRoutes"));
 app.use("/api/schemes", protect, scopeCompany, requirePermission("schemes", { readOnly: true }), require("./routes/schemeRoutes"));
 app.use("/api/opening-bills", protect, scopeCompany, requirePermission("openingBills", { readOnly: true }), require("./routes/openingBillRoutes"));
+app.use("/api/bank-accounts", protect, scopeCompany, requirePermission("bankAccounts", { readOnly: true }), require("./routes/bankAccountRoutes"));
 // Transactional modules — gated by their own permission, ALL methods
 // (including GET/list): unlike master data, a staff member without a given
 // module's permission genuinely shouldn't see that module's records at all.
@@ -125,6 +126,9 @@ app.use("/api/sales", protect, scopeCompany, requirePermission("sale"), require(
 app.use("/api/purchase-returns", protect, scopeCompany, requirePermission("purchaseReturn"), require("./routes/purchaseReturnRoutes"));
 app.use("/api/sale-returns", protect, scopeCompany, requirePermission("saleReturn"), require("./routes/saleReturnRoutes"));
 app.use("/api/stock-transfers", protect, scopeCompany, requirePermission("stockTransfer"), require("./routes/stockTransferRoutes"));
+app.use("/api/bank-transfers", protect, scopeCompany, requirePermission("payments"), require("./routes/bankTransferRoutes"));
+app.use("/api/payments", protect, scopeCompany, requirePermission("payments"), require("./routes/paymentRoutes"));
+app.use("/api/expenses", protect, scopeCompany, requirePermission("payments"), require("./routes/expenseRoutes"));
 app.use("/api/export-list", protect, scopeCompany, require("./routes/exportListRoutes"));
 app.use("/api/reports", protect, scopeCompany, requirePermission("reports"), require("./routes/reportRoutes"));
 

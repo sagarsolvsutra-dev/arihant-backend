@@ -363,7 +363,28 @@ const getSupplierReport = async (req, res) => {
           $group: {
             _id: { purchaseId: "$_id", supplierId: "$itemDoc.supplierId" },
             lineAmount: { $sum: "$items.netValue" },
+            // Purchase's pendingAmount is header-level (one invoice, not per-line —
+            // see quirk #9), so when a single invoice's lines span more than one
+            // supplier, naively attributing the FULL header pendingAmount to every
+            // supplier that touched it would double- (or N-times-) count that money
+            // across the report. Instead each supplier's share is apportioned below,
+            // proportional to its own lines' share of the invoice's total billed
+            // amount — the shares sum back to exactly the invoice's real
+            // pendingAmount, no matter how many suppliers its lines span.
             pendingAmount: { $first: "$pendingAmount" },
+            netAmount: { $first: "$netAmount" },
+          },
+        },
+        {
+          $project: {
+            lineAmount: 1,
+            pendingShare: {
+              $cond: [
+                { $gt: ["$netAmount", 0] },
+                { $multiply: ["$pendingAmount", { $divide: ["$lineAmount", "$netAmount"] }] },
+                0,
+              ],
+            },
           },
         },
         {
@@ -371,7 +392,7 @@ const getSupplierReport = async (req, res) => {
             _id: "$_id.supplierId",
             count: { $sum: 1 },
             amount: { $sum: "$lineAmount" },
-            pendingAmount: { $sum: "$pendingAmount" },
+            pendingAmount: { $sum: "$pendingShare" },
           },
         },
       ]);
@@ -893,40 +914,64 @@ async function buildFullStockReport(query, { cap = FULL_STOCK_ROW_CAP } = {}) {
   const items = await Item.find(itemQuery).populate("supplierId", "name").sort({ itemName: 1 }).limit(cap).lean();
   const itemIds = items.map((i) => i._id);
 
-  async function sumPiecesByItem(Model, dateFilter) {
+  async function sumPiecesByItem(Model, dateFilter, lineMatch) {
     if (!itemIds.length || !dateFilter) return new Map();
     const rows = await Model.aggregate([
       { $match: { companyId: oid(companyId), ...dateFilter } },
       { $unwind: "$items" },
-      { $match: { "items.itemId": { $in: itemIds } } },
+      { $match: { "items.itemId": { $in: itemIds }, ...(lineMatch || {}) } },
       { $group: { _id: "$items.itemId", pcs: { $sum: "$items.totalPieces" } } },
     ]);
     return new Map(rows.map((r) => [String(r._id), r.pcs]));
   }
 
-  const beforeDate = dateFrom ? new Date(`${dateFrom}T00:00:00.000Z`) : null;
-  const before = (field) => (beforeDate ? { [field]: { $lt: beforeDate } } : null);
+  // Every figure in this report is derived from `openingStockFreshPcs`, but Sale
+  // Return is the one module whose lines don't all land there: its applyOneLine
+  // routes each line into the Fresh/Expired/Damaged bucket by its own
+  // `condition`, so an Expired or Damaged return never moves the Fresh total.
+  // Counting those lines here understated Opening by exactly their pieces (and,
+  // once a dateTo was set, Closing too). `$nin` rather than `=== "Fresh"` so a
+  // legacy line with no condition stored is treated as Fresh, matching
+  // applyOneLine's own fallback. Purchase/Sale/Purchase Return all move the
+  // Fresh bucket unconditionally and so need no equivalent filter.
+  const freshLinesOnly = { "items.condition": { $nin: ["Expired", "Damaged"] } };
 
-  const [purchaseBeforeMap, saleBeforeMap, pReturnBeforeMap, sReturnBeforeMap, purchaseInMap, saleInMap, pReturnInMap, sReturnInMap] =
+  // `item.openingStockFreshPcs` is NOT a frozen historical baseline — it's the
+  // item's CURRENT, continuously-updated total stock (every Purchase/Sale/
+  // Return's applyStockDelta increments it in place; see the Multi-Godown Stock
+  // section's "flat fields are the source of truth" invariant). It already
+  // reflects every purchase/sale/return ever made against this item, including
+  // everything before dateFrom. So "Opening as of dateFrom" can't be computed
+  // by ADDING pre-dateFrom deltas on top of it (that double-counts them) — it
+  // has to be computed by WALKING BACKWARD from the current total, subtracting
+  // out everything dated on-or-after dateFrom (with no upper bound — dateTo
+  // only scopes the "Purchase"/"Sale" columns shown in the report body, not
+  // this baseline). When dateFrom itself is unset, "on or after" is unbounded
+  // in both directions too — i.e. all-time — which correctly derives the
+  // item's true original baseline (before any transaction ever touched it).
+  const fromDate = dateFrom ? new Date(`${dateFrom}T00:00:00.000Z`) : null;
+  const onOrAfterFrom = (field) => (fromDate ? { [field]: { $gte: fromDate } } : {});
+
+  const [purchaseFromMap, saleFromMap, pReturnFromMap, sReturnFromMap, purchaseInMap, saleInMap, pReturnInMap, sReturnInMap] =
     await Promise.all([
-      sumPiecesByItem(Purchase, before("invoiceDate")),
-      sumPiecesByItem(Sale, before("invoiceDate")),
-      sumPiecesByItem(PurchaseReturn, before("returnDate")),
-      sumPiecesByItem(SaleReturn, before("returnDate")),
+      sumPiecesByItem(Purchase, onOrAfterFrom("invoiceDate")),
+      sumPiecesByItem(Sale, onOrAfterFrom("invoiceDate")),
+      sumPiecesByItem(PurchaseReturn, onOrAfterFrom("returnDate")),
+      sumPiecesByItem(SaleReturn, onOrAfterFrom("returnDate"), freshLinesOnly),
       sumPiecesByItem(Purchase, dateRangeFilter("invoiceDate", dateFrom, dateTo)),
       sumPiecesByItem(Sale, dateRangeFilter("invoiceDate", dateFrom, dateTo)),
       sumPiecesByItem(PurchaseReturn, dateRangeFilter("returnDate", dateFrom, dateTo)),
-      sumPiecesByItem(SaleReturn, dateRangeFilter("returnDate", dateFrom, dateTo)),
+      sumPiecesByItem(SaleReturn, dateRangeFilter("returnDate", dateFrom, dateTo), freshLinesOnly),
     ]);
 
   const rowsRaw = items.map((item) => {
     const id = String(item._id);
     const openingPcs =
-      (item.openingStockFreshPcs || 0) +
-      (purchaseBeforeMap.get(id) || 0) -
-      (saleBeforeMap.get(id) || 0) -
-      (pReturnBeforeMap.get(id) || 0) +
-      (sReturnBeforeMap.get(id) || 0);
+      (item.openingStockFreshPcs || 0) -
+      (purchaseFromMap.get(id) || 0) +
+      (saleFromMap.get(id) || 0) +
+      (pReturnFromMap.get(id) || 0) -
+      (sReturnFromMap.get(id) || 0);
 
     const purchasePcs = (purchaseInMap.get(id) || 0) - (pReturnInMap.get(id) || 0);
     const salePcs = (saleInMap.get(id) || 0) - (sReturnInMap.get(id) || 0);
@@ -1272,8 +1317,24 @@ const exportSupplierReport = async (req, res) => {
         { $lookup: { from: "items", localField: "items.itemId", foreignField: "_id", as: "itemDoc" } },
         { $unwind: "$itemDoc" },
         { $match: { "itemDoc.supplierId": { $in: supplierIds } } },
-        { $group: { _id: { purchaseId: "$_id", supplierId: "$itemDoc.supplierId" }, lineAmount: { $sum: "$items.netValue" }, pendingAmount: { $first: "$pendingAmount" } } },
-        { $group: { _id: "$_id.supplierId", count: { $sum: 1 }, amount: { $sum: "$lineAmount" }, pendingAmount: { $sum: "$pendingAmount" } } },
+        // Apportioned exactly as getSupplierReport does — see the comment on its
+        // own copy of this pipeline for why the header pendingAmount can't just
+        // be summed per supplier. Without this the exported "Net Pending"
+        // disagreed with the on-screen figure for every multi-supplier invoice.
+        { $group: { _id: { purchaseId: "$_id", supplierId: "$itemDoc.supplierId" }, lineAmount: { $sum: "$items.netValue" }, pendingAmount: { $first: "$pendingAmount" }, netAmount: { $first: "$netAmount" } } },
+        {
+          $project: {
+            lineAmount: 1,
+            pendingShare: {
+              $cond: [
+                { $gt: ["$netAmount", 0] },
+                { $multiply: ["$pendingAmount", { $divide: ["$lineAmount", "$netAmount"] }] },
+                0,
+              ],
+            },
+          },
+        },
+        { $group: { _id: "$_id.supplierId", count: { $sum: 1 }, amount: { $sum: "$lineAmount" }, pendingAmount: { $sum: "$pendingShare" } } },
       ]);
       purchaseMap = new Map(rows.map((r) => [String(r._id), r]));
     }

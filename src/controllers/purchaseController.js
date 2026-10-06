@@ -1,7 +1,10 @@
 const Purchase = require("../models/Purchase");
 const Item = require("../models/Item");
 const Godown = require("../models/Godown");
+const Payment = require("../models/Payment");
+const BankAccount = require("../models/BankAccount");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const { usesBankAccount } = require("../utils/paymentModes");
 
 // Finds which of the item's mrpEntries the client is purchasing against, by
 // matching on MRP (guaranteed unique per item) — never trusts client-supplied
@@ -40,6 +43,13 @@ function computeLine(raw, item) {
     lessPercent < 0 || cdPercent < 0 || gstPercent < 0 || gstPercent > 100
   ) {
     throw new Error(`Quantities and rates cannot be negative (item: ${item.itemName})`);
+  }
+  // Case/Pcs/Free Qty are discrete piece counts — a fractional value (e.g. a
+  // client sending caseQty: 2.3) was previously accepted silently and would
+  // carry a floating-point remainder through totalPieces/stock all the way
+  // into the Item's stored pcs fields.
+  if (!Number.isInteger(caseQty) || !Number.isInteger(pcsQty) || !Number.isInteger(freeQty)) {
+    throw new Error(`Case, Pcs, and Free Qty must be whole numbers (item: ${item.itemName})`);
   }
   if (caseQty === 0 && pcsQty === 0) {
     throw new Error(`Enter a Case or Pcs quantity greater than 0 (item: ${item.itemName})`);
@@ -288,6 +298,76 @@ async function assertSufficientStock(lines, companyId) {
   }
 }
 
+// Purchase has no persisted supplierId anywhere on the document (deliberate,
+// long-standing design — see CLAUDE.md quirk #9), so the auto-created advance
+// Payment's partyId can't be read straight off the invoice the way Sale/the
+// Return controllers can. Best-effort resolve it via the first line's own
+// Item.supplierId — the same join-through-Item pattern already used by
+// reportController.getSupplierReport and the Purchase Return "Fetch" button's
+// own Supplier suggestion for this identical problem.
+async function resolveSupplierIdForLines(lines) {
+  if (!Array.isArray(lines) || lines.length === 0) return null;
+  const firstItem = await Item.findById(lines[0].itemId).select("supplierId").lean();
+  return firstItem?.supplierId || null;
+}
+
+// Reverses the auto-created advance-payment Payment record (+ its BankAccount
+// effect) for one invoice, if one exists — matched via `allocations`, since
+// Payment carries no direct FK back to its source invoice. Safe to call even
+// when no such Payment exists (e.g. the invoice's paid amount was 0). Shared
+// by updateX (before re-applying the new paid amount) and deleteX.
+async function reverseInvoicePayment(invoiceId, invoiceType, companyId) {
+  const existing = await Payment.findOne({
+    companyId,
+    "allocations.invoiceId": invoiceId,
+    "allocations.invoiceType": invoiceType,
+  });
+  if (!existing) return;
+  // Reversal is driven by the stored Payment, so it always undoes exactly what
+  // was applied. The `existing.bankAccountId` half is what keeps records written
+  // before Cheque/UPI moved the bank safe: those carry a null bankAccountId and
+  // never debited anything, so they must not be credited back now.
+  if (usesBankAccount(existing.paymentMode) && existing.bankAccountId) {
+    // "Pay" means money left the bank when this was first created — reversing
+    // gives it back; "Receive" means money came in — reversing takes it back out.
+    await BankAccount.findByIdAndUpdate(existing.bankAccountId, {
+      $inc: { currentBalance: existing.paymentType === "Pay" ? existing.amount : -existing.amount },
+    });
+  }
+  await Payment.deleteOne({ _id: existing._id });
+}
+
+// Creates a fresh advance-payment Payment record (+ its BankAccount effect)
+// for one invoice. Mirrors createX's own inline block, extracted so updateX
+// can reuse it identically instead of re-deriving the same logic.
+async function createInvoicePayment({ companyId, invoiceId, invoiceType, invoiceNo, date, partyType, partyId, paymentType, paymentMode, bankAccountId, amount, noteVerb }) {
+  if (!(amount > 0)) return;
+  if (usesBankAccount(paymentMode) && bankAccountId) {
+    const bank = await BankAccount.findById(bankAccountId);
+    if (!bank) throw new Error("Bank account not found");
+    if (paymentType === "Pay") {
+      if ((bank.currentBalance || 0) < amount) {
+        throw new Error("Insufficient balance in selected Bank Account");
+      }
+      await BankAccount.findByIdAndUpdate(bankAccountId, { $inc: { currentBalance: -amount } });
+    } else {
+      await BankAccount.findByIdAndUpdate(bankAccountId, { $inc: { currentBalance: amount } });
+    }
+  }
+  await Payment.create({
+    companyId,
+    paymentDate: date,
+    paymentType,
+    partyType,
+    partyId: partyId || null,
+    paymentMode: paymentMode || "Cash",
+    bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
+    amount,
+    notes: `${noteVerb} ${invoiceType} Invoice ${invoiceNo}`,
+    allocations: [{ invoiceId, invoiceType, allocatedAmount: amount }],
+  });
+}
+
 const getPurchases = async (req, res) => {
   try {
     const { companyId, page = 1, limit = 10, search = "", dateFrom, dateTo } = req.query;
@@ -345,7 +425,7 @@ const getPurchaseById = async (req, res) => {
 const createPurchase = async (req, res) => {
   let purchase;
   try {
-    const { companyId, invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate } = req.body;
+    const { companyId, invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate, paymentMode, bankAccountId } = req.body;
 
     if (!companyId || !invoiceNo || !invoiceDate) {
       return res.status(400).json({ message: "Please provide all required fields" });
@@ -371,16 +451,42 @@ const createPurchase = async (req, res) => {
       ...totals,
       paidAmount: paid,
       pendingAmount: totals.netAmount - paid,
+      paymentMode,
+      bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
       dueDate: dueDate || null,
     });
 
+    // Payment creation and the stock effect are both wrapped in the SAME try/catch —
+    // a failure in either one (bank not found, a future schema mismatch, insufficient
+    // stock, ...) must delete the just-created Purchase and reverse whatever
+    // advance-payment effect was already applied. Confirmed live: an earlier version
+    // only wrapped the stock step, and a payment-creation failure (a real bug — see
+    // the Payment model's invoiceType enum mismatch, now fixed) left a fully orphaned
+    // Purchase document behind with no stock effect and no payment, permanently
+    // occupying its own invoiceNo.
     try {
+      if (paid > 0) {
+        const supplierId = await resolveSupplierIdForLines(lines);
+        await createInvoicePayment({
+          companyId,
+          invoiceId: purchase._id,
+          invoiceType: "Purchase",
+          invoiceNo: purchase.invoiceNo,
+          date: invoiceDate,
+          partyType: "Supplier",
+          partyId: supplierId,
+          paymentType: "Pay",
+          paymentMode,
+          bankAccountId,
+          amount: paid,
+          noteVerb: "Advance for",
+        });
+      }
       await applyStockDelta(lines, 1, companyId);
-    } catch (stockErr) {
-      // The document already committed but its stock effect failed partway through —
-      // delete it rather than leave a Purchase on the books with no matching stock change.
+    } catch (err) {
       await Purchase.deleteOne({ _id: purchase._id });
-      throw stockErr;
+      await reverseInvoicePayment(purchase._id, "Purchase", companyId);
+      throw err;
     }
 
     res.status(201).json(purchase);
@@ -400,8 +506,13 @@ const updatePurchase = async (req, res) => {
     // rollback path (if buildLines/`.save()`/the reapply throws) must reverse using
     // this original snapshot, not whatever `purchase.items` has since become.
     const oldItems = purchase.items;
+    const oldPaidAmount = purchase.paidAmount;
+    const oldPaymentMode = purchase.paymentMode;
+    const oldBankAccountId = purchase.bankAccountId;
+    const oldInvoiceNo = purchase.invoiceNo;
+    const oldInvoiceDate = purchase.invoiceDate;
 
-    const { invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate } = req.body;
+    const { invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate, paymentMode, bankAccountId } = req.body;
 
     if (invoiceNo && invoiceNo.trim() !== purchase.invoiceNo) {
       const exists = await Purchase.findOne({
@@ -421,6 +532,12 @@ const updatePurchase = async (req, res) => {
     // no shared "old godown" concept needed even though lines can span several.
     await assertSufficientStock(oldItems, companyId);
     await applyStockDelta(oldItems, -1, companyId);
+    // Reverse whatever advance-payment effect the OLD paid amount applied — the
+    // (possibly unchanged) new amount is re-applied below once the rest of the
+    // update succeeds, same reverse-then-reapply shape as the stock line above.
+    // Without this, editing a Purchase's Paid Amount left a stale Payment record
+    // and bank balance that no longer matched the invoice at all.
+    await reverseInvoicePayment(purchase._id, "Purchase", companyId);
 
     try {
       const lines = await buildLines(items || oldItems, companyId);
@@ -434,9 +551,12 @@ const updatePurchase = async (req, res) => {
       purchase.items = lines;
       Object.assign(purchase, totals);
 
-      const paid = paidAmount !== undefined ? parseFloat(paidAmount) || 0 : purchase.paidAmount;
+      const paid = paidAmount !== undefined ? parseFloat(paidAmount) || 0 : oldPaidAmount;
       purchase.paidAmount = paid;
       purchase.pendingAmount = totals.netAmount - paid;
+      if (paymentMode !== undefined) purchase.paymentMode = paymentMode;
+      if (usesBankAccount(paymentMode)) purchase.bankAccountId = bankAccountId;
+      else if (paymentMode) purchase.bankAccountId = null;
       if (dueDate !== undefined) purchase.dueDate = dueDate || null;
 
       // The field mutation + save + reapply must all succeed together, or the
@@ -446,8 +566,45 @@ const updatePurchase = async (req, res) => {
       // already been taken back, and a retry of the same bad request removes it again.
       await purchase.save();
       await applyStockDelta(lines, 1, companyId);
+
+      if (paid > 0) {
+        const supplierId = await resolveSupplierIdForLines(lines);
+        await createInvoicePayment({
+          companyId,
+          invoiceId: purchase._id,
+          invoiceType: "Purchase",
+          invoiceNo: purchase.invoiceNo,
+          date: purchase.invoiceDate,
+          partyType: "Supplier",
+          partyId: supplierId,
+          paymentType: "Pay",
+          paymentMode: purchase.paymentMode,
+          bankAccountId: purchase.bankAccountId,
+          amount: paid,
+          noteVerb: "Advance for",
+        });
+      }
     } catch (err) {
       await applyStockDelta(oldItems, 1, companyId);
+      // Restore the OLD payment too, on a best-effort basis, so a failed update
+      // doesn't leave the invoice with neither its old nor its new advance payment.
+      if (oldPaidAmount > 0) {
+        const supplierId = await resolveSupplierIdForLines(oldItems);
+        await createInvoicePayment({
+          companyId,
+          invoiceId: purchase._id,
+          invoiceType: "Purchase",
+          invoiceNo: oldInvoiceNo,
+          date: oldInvoiceDate,
+          partyType: "Supplier",
+          partyId: supplierId,
+          paymentType: "Pay",
+          paymentMode: oldPaymentMode,
+          bankAccountId: oldBankAccountId,
+          amount: oldPaidAmount,
+          noteVerb: "Advance for",
+        }).catch(() => {});
+      }
       throw err;
     }
 
@@ -466,6 +623,10 @@ const deletePurchase = async (req, res) => {
 
     await assertSufficientStock(purchase.items, purchase.companyId);
     await applyStockDelta(purchase.items, -1, purchase.companyId);
+    // Reverse the advance-payment effect (bank balance + the Payment record) before
+    // the invoice it's allocated to stops existing — otherwise the Payment is
+    // orphaned forever and the bank balance never gets the money back.
+    await reverseInvoicePayment(purchase._id, "Purchase", purchase.companyId);
     await purchase.deleteOne();
 
     res.status(200).json({ message: "Purchase deleted successfully" });

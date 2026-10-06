@@ -92,6 +92,16 @@ const PurchaseReturnSchema = new mongoose.Schema(
     // what's still owed to us, and when it's expected.
     refundAmount: { type: Number, default: 0 },
     pendingAmount: { type: Number, default: 0 },
+    paymentMode: {
+      type: String,
+      enum: ["Cash", "Bank", "UPI", "Cheque"],
+      default: "Cash",
+    },
+    bankAccountId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BankAccount",
+      default: null,
+    },
     dueDate: { type: Date, default: null },
   },
   {

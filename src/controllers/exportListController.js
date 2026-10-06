@@ -110,6 +110,11 @@ const LIST_EXPORT_CONFIG = {
     model: Customer,
     populate: [{ path: "customerGroupId", select: "name" }],
     searchFields: ["name", "phone", "email", "city"],
+    // The Customers list page has a real server-side Customer Type filter
+    // (customerController.getCustomers honours ?customerType=) — without this
+    // the export ignored it and returned every customer regardless of what the
+    // table on screen had been narrowed to.
+    exactFilterFields: ["customerType"],
     columns: [
       { header: "Name", width: 120, accessor: (r) => r.name },
       { header: "Group", width: 90, accessor: (r) => r.customerGroupId?.name || "-" },
@@ -398,6 +403,10 @@ const exportList = async (req, res) => {
       if (dateFrom) filter[config.dateField].$gte = new Date(`${dateFrom}T00:00:00.000Z`);
       if (dateTo) filter[config.dateField].$lte = new Date(`${dateTo}T23:59:59.999Z`);
     }
+    (config.exactFilterFields || []).forEach((field) => {
+      const value = req.query[field];
+      if (value) filter[field] = value;
+    });
     if (search && search.trim() && Array.isArray(config.searchFields) && config.searchFields.length) {
       const escaped = search.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const regex = { $regex: escaped, $options: "i" };
