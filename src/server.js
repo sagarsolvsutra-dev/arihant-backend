@@ -95,6 +95,14 @@ app.use("/api/users", protect, scopeCompany, require("./routes/userRoutes"));
 // everyone else gets their own company's, scoped via req.effectiveCompanyId).
 app.use("/api/dashboard", protect, scopeCompany, require("./routes/dashboardRoutes"));
 
+// GST business-detail lookup (Customer/Supplier Add/Edit's GSTIN auto-fill,
+// see lib/gst.ts on the frontend) — just `protect`, no scopeCompany/
+// requirePermission: it's a stateless proxy to gstinapi.in with no
+// company-scoped data of its own, and it's used inline from both the
+// Customers and Suppliers forms, so gating it behind either module's
+// permission would wrongly block the other.
+app.use("/api/gst", protect, require("./routes/gstRoutes"));
+
 // Master Routes — each master-data resource is its OWN permission module now
 // (see utils/permissions.js's history note — this used to be one combined
 // "masters" key, split apart on direct request), but every one of them stays
