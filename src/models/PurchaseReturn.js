@@ -103,6 +103,13 @@ const PurchaseReturnSchema = new mongoose.Schema(
       default: null,
     },
     dueDate: { type: Date, default: null },
+    narrations: [
+      {
+        narrationId: { type: mongoose.Schema.Types.ObjectId, ref: "Narration" },
+        type: { type: String },
+        code: { type: String },
+      },
+    ],
   },
   {
     timestamps: true,

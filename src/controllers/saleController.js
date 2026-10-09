@@ -3,8 +3,31 @@ const Item = require("../models/Item");
 const Godown = require("../models/Godown");
 const Payment = require("../models/Payment");
 const BankAccount = require("../models/BankAccount");
+const Narration = require("../models/Narration");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+
+async function resolveNarrations(clientNarrations, companyId) {
+  if (!Array.isArray(clientNarrations) || clientNarrations.length === 0) return [];
+  const isStringArray = typeof clientNarrations[0] === 'string' || clientNarrations[0] instanceof String;
+  const ids = isStringArray ? clientNarrations : clientNarrations.map(n => n.narrationId || n._id);
+
+  const docs = await Narration.find({ _id: { $in: ids }, companyId }).lean();
+  const byId = new Map(docs.map((d) => [String(d._id), d]));
+
+  return clientNarrations
+    .map((cn) => {
+      const id = isStringArray ? cn : (cn.narrationId || cn._id);
+      const d = byId.get(String(id));
+      if (!d) return null;
+      return {
+        narrationId: d._id,
+        type: d.type,
+        code: isStringArray ? d.code : (cn.code !== undefined ? cn.code : d.code)
+      };
+    })
+    .filter(Boolean);
+}
 
 // Finds which of the item's mrpEntries the client is selling against, by
 // matching on MRP (guaranteed unique per item) — same lookup Purchase uses.
@@ -249,6 +272,7 @@ async function createInvoicePayment({ companyId, invoiceId, invoiceType, invoice
     amount,
     notes: `${noteVerb} ${invoiceType} Invoice ${invoiceNo}`,
     allocations: [{ invoiceId, invoiceType, allocatedAmount: amount }],
+    narrations: arguments[0].narrations || [],
   });
 }
 
@@ -381,7 +405,7 @@ const getSaleById = async (req, res) => {
 const createSale = async (req, res) => {
   let sale;
   try {
-    const { companyId, invoiceType, paymentType, invoiceNo, invoiceDate, deliveryDate, customerId, notes, items, receivedAmount, dueDate, paymentMode, bankAccountId } = req.body;
+    const { companyId, invoiceType, paymentType, invoiceNo, invoiceDate, deliveryDate, customerId, notes, items, receivedAmount, dueDate, paymentMode, bankAccountId, narrationIds } = req.body;
 
     if (!companyId || !invoiceNo || !invoiceDate || !customerId) {
       return res.status(400).json({ message: "Please provide all required fields" });
@@ -413,6 +437,7 @@ const createSale = async (req, res) => {
       paymentMode,
       bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
       dueDate: dueDate || null,
+      narrations: narrationIds ? await resolveNarrations(narrationIds, companyId) : [],
     });
 
     // Payment creation and the stock effect are both wrapped in the SAME try/catch —
@@ -434,6 +459,7 @@ const createSale = async (req, res) => {
           bankAccountId,
           amount: received,
           noteVerb: "Advance for",
+          narrations: sale.narrations,
         });
       }
       await applyStockDelta(lines, -1, companyId);
@@ -466,8 +492,9 @@ const updateSale = async (req, res) => {
     const oldCustomerId = sale.customerId;
     const oldInvoiceNo = sale.invoiceNo;
     const oldInvoiceDate = sale.invoiceDate;
+    const oldNarrations = sale.narrations;
 
-    const { invoiceType, paymentType, invoiceNo, invoiceDate, deliveryDate, customerId, notes, items, receivedAmount, dueDate, paymentMode, bankAccountId } = req.body;
+    const { invoiceType, paymentType, invoiceNo, invoiceDate, deliveryDate, customerId, notes, items, receivedAmount, dueDate, paymentMode, bankAccountId, narrationIds } = req.body;
 
     if (invoiceNo && invoiceNo.trim() !== sale.invoiceNo) {
       const exists = await Sale.findOne({
@@ -512,6 +539,9 @@ const updateSale = async (req, res) => {
       if (usesBankAccount(paymentMode)) sale.bankAccountId = bankAccountId;
       else if (paymentMode) sale.bankAccountId = null;
       if (dueDate !== undefined) sale.dueDate = dueDate || null;
+      if (narrationIds !== undefined) {
+        sale.narrations = await resolveNarrations(narrationIds, companyId);
+      }
 
       // The field mutation + save + reapply must all succeed together, or the
       // reversal above must be undone — otherwise a validation/cast error thrown by
@@ -536,6 +566,7 @@ const updateSale = async (req, res) => {
           bankAccountId: sale.bankAccountId,
           amount: received,
           noteVerb: "Advance for",
+          narrations: sale.narrations,
         });
       }
     } catch (err) {
@@ -556,6 +587,7 @@ const updateSale = async (req, res) => {
           bankAccountId: oldBankAccountId,
           amount: oldReceivedAmount,
           noteVerb: "Advance for",
+          narrations: oldNarrations,
         }).catch(() => {});
       }
       throw err;

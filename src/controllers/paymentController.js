@@ -3,8 +3,34 @@ const Sale = require("../models/Sale");
 const Purchase = require("../models/Purchase");
 const Item = require("../models/Item");
 const BankAccount = require("../models/BankAccount");
+const Narration = require("../models/Narration");
 const { isValidObjectId } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+
+// Resolves client-submitted Narration ids against the company's own Narration
+// master and snapshots {narrationId, type, code} — see Expense.js's
+// NarrationRefSchema comment for why this is a copy, not a live reference.
+async function resolveNarrations(clientNarrations, companyId) {
+  if (!Array.isArray(clientNarrations) || clientNarrations.length === 0) return [];
+  const isStringArray = typeof clientNarrations[0] === 'string' || clientNarrations[0] instanceof String;
+  const ids = isStringArray ? clientNarrations : clientNarrations.map(n => n.narrationId || n._id);
+
+  const docs = await Narration.find({ _id: { $in: ids }, companyId }).lean();
+  const byId = new Map(docs.map((d) => [String(d._id), d]));
+
+  return clientNarrations
+    .map((cn) => {
+      const id = isStringArray ? cn : (cn.narrationId || cn._id);
+      const d = byId.get(String(id));
+      if (!d) return null;
+      return {
+        narrationId: d._id,
+        type: d.type,
+        code: isStringArray ? d.code : (cn.code !== undefined ? cn.code : d.code)
+      };
+    })
+    .filter(Boolean);
+}
 
 // Money here is plain JS floats that have already been through at least one
 // round of arithmetic (an invoice's pendingAmount is netAmount - paid), so an
@@ -160,7 +186,8 @@ exports.createPayment = async (req, res) => {
       amount,
       referenceNo,
       notes,
-      allocations
+      allocations,
+      narrationIds
     } = req.body;
 
     const parsedAmount = parseFloat(amount);
@@ -187,6 +214,8 @@ exports.createPayment = async (req, res) => {
       return res.status(400).json({ message: allocationError });
     }
 
+    const narrations = await resolveNarrations(narrationIds, companyId);
+
     const payment = await Payment.create({
       companyId,
       paymentDate,
@@ -198,7 +227,8 @@ exports.createPayment = async (req, res) => {
       amount: parsedAmount,
       referenceNo,
       notes,
-      allocations
+      allocations,
+      narrations,
     });
 
     try {
@@ -273,7 +303,8 @@ exports.updatePayment = async (req, res) => {
       amount,
       referenceNo,
       notes,
-      allocations
+      allocations,
+      narrationIds
     } = req.body;
 
     const parsedAmount = parseFloat(amount);
@@ -332,6 +363,8 @@ exports.updatePayment = async (req, res) => {
       throw effectErr;
     }
 
+    const narrations = narrationIds !== undefined ? await resolveNarrations(narrationIds, companyId) : existing.narrations;
+
     const payment = await Payment.findByIdAndUpdate(
       existing._id,
       {
@@ -344,7 +377,8 @@ exports.updatePayment = async (req, res) => {
         amount: parsedAmount,
         referenceNo,
         notes,
-        allocations
+        allocations,
+        narrations,
       },
       { new: true }
     );

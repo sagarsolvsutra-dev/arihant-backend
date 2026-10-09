@@ -100,13 +100,21 @@ exports.getBankAccountStatement = async (req, res) => {
   try {
     const { companyId } = req.user;
     const { id } = req.params;
+    const { dateFrom, dateTo } = req.query;
 
     const bankAccount = await BankAccount.findOne({ _id: id, companyId });
     if (!bankAccount) {
       return res.status(404).json({ message: "Bank Account not found" });
     }
 
-    const payments = await Payment.find({ bankAccountId: id, companyId })
+    let filter = { bankAccountId: id, companyId };
+    if (dateFrom || dateTo) {
+      filter.paymentDate = {};
+      if (dateFrom) filter.paymentDate.$gte = new Date(dateFrom);
+      if (dateTo) filter.paymentDate.$lte = new Date(dateTo);
+    }
+
+    const payments = await Payment.find(filter)
       .populate("partyId", "name companyName bankName accountNumber title category")
       .sort({ paymentDate: 1, createdAt: 1 });
 

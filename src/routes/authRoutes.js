@@ -1,13 +1,32 @@
 const express = require("express");
 const router = express.Router();
 const { protect, requireRole } = require("../middlewares/auth");
-const { login, me, register, getUsers, logout } = require("../controllers/authController");
+const {
+  login,
+  me,
+  register,
+  getUsers,
+  logout,
+  forgotPassword,
+  resetPassword,
+  updateProfile,
+  updatePassword,
+} = require("../controllers/authController");
 
 // login/logout stay public — there's no token yet to check at login, and
 // logout is a stateless no-op either way.
 router.post("/login", login);
 router.post("/logout", logout);
 router.get("/me", protect, me);
+
+// Public like login, for the same reason: somebody who cannot sign in is exactly
+// who needs these.
+router.post("/forgot-password", forgotPassword);
+router.post("/reset-password", resetPassword);
+
+// Your own account. Narrow on purpose — see updateProfile in the controller.
+router.put("/profile", protect, updateProfile);
+router.put("/password", protect, updatePassword);
 
 // Account creation is now a super_admin-only action, not public self-service —
 // the only real caller is the /super-admin/users "Add User" dialog. This is on

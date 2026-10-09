@@ -1,5 +1,6 @@
 require("dotenv").config();
 const express = require("express");
+const { warmUpMailer } = require('./utils/mailer');
 const cors = require("cors");
 const dns = require("dns");
 const helmet = require("helmet");
@@ -109,6 +110,9 @@ app.use("/api/supplier-groups", protect, scopeCompany, requirePermission("suppli
 app.use("/api/godown-groups", protect, scopeCompany, requirePermission("godownGroups", { readOnly: true }), require("./routes/godownGroupRoutes"));
 app.use("/api/godowns", protect, scopeCompany, requirePermission("godowns", { readOnly: true }), require("./routes/godownRoutes"));
 app.use("/api/hsn", protect, scopeCompany, requirePermission("hsn", { readOnly: true }), hsnRoutes);
+app.use("/api/account-groups", protect, scopeCompany, requirePermission("accountGroups", { readOnly: true }), require("./routes/accountGroupRoutes"));
+app.use("/api/accounts", protect, scopeCompany, requirePermission("accounts", { readOnly: true }), require("./routes/accountRoutes"));
+app.use("/api/narrations", protect, scopeCompany, requirePermission("narrations", { readOnly: true }), require("./routes/narrationRoutes"));
 
 // Data Routes
 app.use("/api/items", protect, scopeCompany, requirePermission("items", { readOnly: true }), require("./routes/itemRoutes"));
@@ -149,5 +153,8 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT;
 
 app.listen(PORT, () => {
+      // Pays the SMTP handshake now instead of making whoever first asks for a
+      // password reset wait for it.
+      warmUpMailer();
   console.log(`🚀 Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
 });

@@ -1,7 +1,36 @@
 const BankTransfer = require("../models/BankTransfer");
 const BankAccount = require("../models/BankAccount");
 const Payment = require("../models/Payment");
+const Narration = require("../models/Narration");
 const { clampLimit, clampPage } = require("../utils/queryHelpers");
+
+// Resolves client-submitted Narration ids against the company's own Narration
+// master and snapshots {narrationId, type, code} — see Expense.js's
+// NarrationRefSchema comment for why this is a copy, not a live reference.
+// Invalid/foreign ids are silently dropped (informational tag, not worth
+// blocking a save over) — identical helper to expenseController's own, kept
+// duplicated per this codebase's established per-controller-helper style.
+async function resolveNarrations(clientNarrations, companyId) {
+  if (!Array.isArray(clientNarrations) || clientNarrations.length === 0) return [];
+  const isStringArray = typeof clientNarrations[0] === 'string' || clientNarrations[0] instanceof String;
+  const ids = isStringArray ? clientNarrations : clientNarrations.map(n => n.narrationId || n._id);
+
+  const docs = await Narration.find({ _id: { $in: ids }, companyId }).lean();
+  const byId = new Map(docs.map((d) => [String(d._id), d]));
+
+  return clientNarrations
+    .map((cn) => {
+      const id = isStringArray ? cn : (cn.narrationId || cn._id);
+      const d = byId.get(String(id));
+      if (!d) return null;
+      return {
+        narrationId: d._id,
+        type: d.type,
+        code: isStringArray ? d.code : (cn.code !== undefined ? cn.code : d.code)
+      };
+    })
+    .filter(Boolean);
+}
 
 const getBankTransfers = async (req, res) => {
   try {
@@ -56,7 +85,7 @@ const getBankTransferById = async (req, res) => {
 
 const createBankTransfer = async (req, res) => {
   try {
-    const { companyId, fromBankId, toBankId, amount, date, notes, referenceNo } = req.body;
+    const { companyId, fromBankId, toBankId, amount, date, notes, referenceNo, narrationIds } = req.body;
 
     if (!fromBankId || !toBankId || !amount || !date) {
       return res.status(400).json({ message: "Missing required fields" });
@@ -94,6 +123,8 @@ const createBankTransfer = async (req, res) => {
     toBank.currentBalance = (toBank.currentBalance || 0) + transferAmount;
     await toBank.save();
 
+    const narrations = await resolveNarrations(narrationIds, companyId);
+
     const transfer = await BankTransfer.create({
       companyId,
       transferDate: date,
@@ -102,6 +133,7 @@ const createBankTransfer = async (req, res) => {
       amount: transferAmount,
       referenceNo: referenceNo || "",
       notes: notes || "",
+      narrations,
     });
 
     // Create Payment for Source (Money Out)
@@ -169,9 +201,117 @@ const deleteBankTransfer = async (req, res) => {
   }
 };
 
+const updateBankTransfer = async (req, res) => {
+  try {
+    const transfer = await BankTransfer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId });
+    if (!transfer) return res.status(404).json({ message: "Transfer not found" });
+
+    const { companyId, date, amount, fromBankId, toBankId, referenceNo, notes, narrationIds } = req.body;
+    
+    const newAmount = Number(amount);
+    if (!Number.isFinite(newAmount) || newAmount <= 0) {
+      return res.status(400).json({ message: "Transfer amount must be greater than 0" });
+    }
+
+    if (fromBankId === toBankId) {
+      return res.status(400).json({ message: "Source and destination banks cannot be the same" });
+    }
+
+    const newFromBank = await BankAccount.findById(fromBankId);
+    const newToBank = await BankAccount.findById(toBankId);
+
+    if (!newFromBank || !newToBank) {
+      return res.status(404).json({ message: "Bank account not found" });
+    }
+
+    // 1. Reverse old effects
+    await BankAccount.findByIdAndUpdate(transfer.fromBankId, { $inc: { currentBalance: transfer.amount } });
+    await BankAccount.findByIdAndUpdate(transfer.toBankId, { $inc: { currentBalance: -transfer.amount } });
+
+    // 2. Validate new balance constraint (must fetch updated balance for newFromBank)
+    const freshFromBank = await BankAccount.findById(fromBankId);
+    if ((freshFromBank.currentBalance || 0) < newAmount) {
+      // Revert reversal
+      await BankAccount.findByIdAndUpdate(transfer.fromBankId, { $inc: { currentBalance: -transfer.amount } });
+      await BankAccount.findByIdAndUpdate(transfer.toBankId, { $inc: { currentBalance: transfer.amount } });
+      return res.status(400).json({ message: "Insufficient balance in source bank account" });
+    }
+
+    // 3. Apply new effects
+    await BankAccount.findByIdAndUpdate(fromBankId, { $inc: { currentBalance: -newAmount } });
+    await BankAccount.findByIdAndUpdate(toBankId, { $inc: { currentBalance: newAmount } });
+
+    const oldDate = transfer.transferDate;
+    const oldAmount = transfer.amount;
+    const oldFromBank = transfer.fromBankId;
+    const oldToBank = transfer.toBankId;
+
+    if (date) transfer.transferDate = date;
+    if (newAmount) transfer.amount = newAmount;
+    if (fromBankId) transfer.fromBankId = fromBankId;
+    if (toBankId) transfer.toBankId = toBankId;
+    if (referenceNo !== undefined) transfer.referenceNo = referenceNo;
+    if (notes !== undefined) transfer.notes = notes;
+
+    if (narrationIds !== undefined) {
+      transfer.narrations = await resolveNarrations(narrationIds, transfer.companyId);
+    }
+
+    await transfer.save();
+
+    // 4. Update the related Payment records
+    // We update all matching payments for this transfer
+    await Payment.updateMany({
+      companyId: transfer.companyId,
+      paymentDate: oldDate,
+      amount: oldAmount,
+      $or: [
+        { bankAccountId: oldFromBank, partyId: oldToBank, paymentType: "Pay" },
+        { bankAccountId: oldToBank, partyId: oldFromBank, paymentType: "Receive" }
+      ]
+    }, {
+      $set: { 
+        paymentDate: date,
+        amount: newAmount,
+        notes: notes || "",
+        referenceNo: referenceNo || ""
+      }
+    });
+
+    // Also update bank references in the payments since fromBank/toBank might have changed
+    await Payment.updateMany({
+      companyId: transfer.companyId,
+      paymentDate: date,
+      amount: newAmount,
+      bankAccountId: oldFromBank,
+      partyId: oldToBank,
+      paymentType: "Pay"
+    }, {
+      $set: { bankAccountId: fromBankId, partyId: toBankId }
+    });
+
+    await Payment.updateMany({
+      companyId: transfer.companyId,
+      paymentDate: date,
+      amount: newAmount,
+      bankAccountId: oldToBank,
+      partyId: oldFromBank,
+      paymentType: "Receive"
+    }, {
+      $set: { bankAccountId: toBankId, partyId: fromBankId }
+    });
+
+
+    res.status(200).json(transfer);
+  } catch (error) {
+    res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
 module.exports = {
   getBankTransfers,
   getBankTransferById,
   createBankTransfer,
+  updateBankTransfer,
   deleteBankTransfer
 };

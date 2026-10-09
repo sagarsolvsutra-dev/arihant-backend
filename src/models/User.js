@@ -54,6 +54,16 @@ const UserSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: {},
     },
+    // Password reset: a 6-digit code emailed to the address on the account,
+    // stored as a SHA-256 hash rather than in the clear, so reading the database
+    // cannot be turned into an account takeover. select: false keeps all three
+    // out of every ordinary query as well.
+    resetPasswordOTP: { type: String, select: false },
+    resetPasswordOTPExpires: { type: Date, select: false },
+    // Six digits is a million guesses and the code lives for ten minutes, which
+    // is long enough to try a great many of them. This counter, not the expiry,
+    // is what makes the window safe.
+    resetPasswordOTPAttempts: { type: Number, default: 0, select: false },
   },
   {
     timestamps: true,

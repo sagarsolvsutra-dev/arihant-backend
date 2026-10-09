@@ -10,6 +10,7 @@ const Sale = require("../models/Sale");
 const PurchaseReturn = require("../models/PurchaseReturn");
 const SaleReturn = require("../models/SaleReturn");
 const OpeningBill = require("../models/OpeningBill");
+const Payment = require("../models/Payment");
 const { searchRegex, clampLimit, clampPage, isValidObjectId } = require("../utils/queryHelpers");
 
 // A report can be exported to Excel far larger than any one paginated page —
@@ -62,16 +63,13 @@ async function sendExcelFile(res, sheetName, columns, records, filename) {
   res.end();
 }
 
-async function sendPdfFile(res, title, columns, records, filename) {
-  const doc = new PDFDocument({ margin: 40, size: "A4", layout: "portrait" });
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-  doc.pipe(res);
-
-  doc.fontSize(16).fillColor("#000").text(title);
-  doc.fontSize(9).fillColor("#666").text(`Generated ${new Date().toLocaleString("en-IN")}`);
-  let y = doc.y + 16;
-  
+// Draws the striped/paginated data table shared by every PDF export below —
+// extracted out of the old sendPdfFile so the Ledger PDF (which now also
+// needs a title/subtitle/summary-cards header above this same table, to
+// visually match the on-screen Ledger page) can reuse the exact table
+// styling without duplicating the header-row/pagination logic.
+function drawDataTable(doc, columns, records, startY) {
+  let y = startY;
   const startX = doc.page.margins.left;
   const totalWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
   const rowHeight = 20;
@@ -118,6 +116,74 @@ async function sendPdfFile(res, title, columns, records, filename) {
     });
     y += rowHeight;
   });
+
+  return y;
+}
+
+async function sendPdfFile(res, title, columns, records, filename) {
+  const doc = new PDFDocument({ margin: 40, size: "A4", layout: "portrait" });
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  doc.pipe(res);
+
+  doc.fontSize(16).fillColor("#000").text(title);
+  doc.fontSize(9).fillColor("#666").text(`Generated ${new Date().toLocaleString("en-IN")}`);
+  const y = doc.y + 16;
+
+  drawDataTable(doc, columns, records, y);
+
+  doc.end();
+}
+
+// Stat-card boxes (label above a bold value) drawn side-by-side across the
+// page width — mirrors the on-screen Ledger page's summary cards (Total
+// Purchases/Total Paid/Closing Balance, etc.) so the exported PDF looks like
+// a printout of what the user actually sees on screen, not just a bare table.
+function drawSummaryCards(doc, cards, startY) {
+  const startX = doc.page.margins.left;
+  const totalWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+  const gap = 10;
+  const cardWidth = (totalWidth - gap * (cards.length - 1)) / cards.length;
+  const cardHeight = 48;
+
+  cards.forEach((card, i) => {
+    const x = startX + i * (cardWidth + gap);
+    doc.rect(x, startY, cardWidth, cardHeight).lineWidth(1).strokeColor("#d9d9d9").stroke();
+    doc.fillColor("#666").fontSize(8).font("Helvetica").text(card.label, x + 10, startY + 10, { width: cardWidth - 20 });
+    doc
+      .fillColor(card.color || "#111111")
+      .fontSize(13)
+      .font("Helvetica-Bold")
+      .text(card.value, x + 10, startY + 25, { width: cardWidth - 20 });
+    doc.font("Helvetica");
+  });
+
+  return startY + cardHeight + 18;
+}
+
+// The Customer/Supplier Ledger's own PDF — a dedicated renderer (not the
+// generic sendPdfFile every other report's PDF uses) specifically because the
+// on-screen Ledger page shows party contact info and 3 summary cards above
+// its table, and the exported PDF is meant to be a faithful printout of that
+// same page, not just the underlying row data. See quirk #57 for why this
+// was built: the plain title+table PDF this replaced showed none of that.
+async function sendLedgerPdf(res, { title, subtitle, cards, columns, records, filename }) {
+  const doc = new PDFDocument({ margin: 40, size: "A4", layout: "portrait" });
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+  doc.pipe(res);
+
+  doc.fontSize(18).fillColor("#000").font("Helvetica-Bold").text(title);
+  doc.font("Helvetica");
+  if (subtitle) {
+    doc.fontSize(9).fillColor("#666").text(subtitle);
+  }
+  doc.fontSize(8).fillColor("#999").text(`Generated ${new Date().toLocaleString("en-IN")}`);
+
+  let y = doc.y + 14;
+  y = drawSummaryCards(doc, cards, y);
+
+  drawDataTable(doc, columns, records, y);
 
   doc.end();
 }
@@ -741,22 +807,63 @@ function buildLedger(entries, dateFrom, dateTo, { debitIncreases = true } = {}) 
   return { openingBalance, closingBalance: running, entries: rows };
 }
 
+// A Payment's Ref No for ledger display: its own referenceNo field if set,
+// else a join of whatever Narration codes are attached to it (the closest
+// thing this app has to a reference for a payment that predates the
+// referenceNo field actually being persisted — see Payment.js's schema
+// comment, referenceNo/notes were read+written by paymentController from the
+// start but silently dropped by Mongoose since neither was ever declared on
+// the schema until this ledger fix). "-" only when genuinely neither exists.
+function paymentRef(p) {
+  if (p.referenceNo) return p.referenceNo;
+  if (Array.isArray(p.narrations) && p.narrations.length > 0) {
+    return p.narrations.map((n) => n.code).filter(Boolean).join(", ") || "-";
+  }
+  return "-";
+}
+
 // Shared by getCustomerLedger and exportCustomerLedger — fetches the party and
 // every raw (unfiltered-by-date) entry; date filtering happens in buildLedger.
+//
+// ⚠️→✅ Now also pulls real Payment-voucher rows (both the auto-created
+// advance-payment Payments quirk #53/#54 wired into Sale/SaleReturn's own
+// create path, AND standalone payments entered via the /payments page) — a
+// payment is a genuinely separate, dated event from the invoice it settles,
+// exactly like Tally's own General Account Ledger shows both a "General
+// Sales" bill row AND a separate "Customer Receipt" row for the same party.
+// This closes a real reported bug: a payment recorded via the Payments page
+// against a Customer/Supplier was invisible in that party's own Ledger —
+// only the underlying Sale/Purchase's `pendingAmount` reflected it, with no
+// dated row of its own. Doesn't double-count anything — the invoice's own
+// entry is still its full gross `netAmount`, unaffected by how much of it has
+// since been paid; the Payment entry is the separate cash-movement event.
 async function loadCustomerLedgerEntries(companyId, customerId) {
   const customer = await Customer.findOne({ _id: customerId, companyId }).lean();
   if (!customer) return null;
 
-  const [sales, saleReturns, openingBills] = await Promise.all([
+  const [sales, saleReturns, openingBills, payments] = await Promise.all([
     Sale.find({ companyId, customerId }).select("invoiceNo invoiceDate netAmount pendingAmount").lean(),
     SaleReturn.find({ companyId, customerId }).select("returnNo returnDate netAmount pendingAmount").lean(),
     OpeningBill.find({ companyId, type: "sale", customerId }).select("billNo billDate totalAmount pendingAmount").lean(),
+    Payment.find({ companyId, partyType: "Customer", partyId: customerId }).select("paymentType paymentDate amount referenceNo narrations").lean(),
   ]);
 
   const entries = [
     ...openingBills.map((b) => ({ date: b.billDate, type: "Opening Balance", ref: b.billNo, id: b._id, debit: b.totalAmount, credit: 0, pendingAmount: b.pendingAmount })),
     ...sales.map((s) => ({ date: s.invoiceDate, type: "Sale", ref: s.invoiceNo, id: s._id, debit: s.netAmount, credit: 0, pendingAmount: s.pendingAmount })),
     ...saleReturns.map((r) => ({ date: r.returnDate, type: "Sale Return", ref: r.returnNo, id: r._id, debit: 0, credit: r.netAmount, pendingAmount: r.pendingAmount })),
+    // "Receive" (money coming in from the customer) credits the ledger —
+    // reduces what they owe, the same direction a Sale Return already uses.
+    // "Pay" (a refund paid out to the customer) debits it, same as a Sale.
+    ...payments.map((p) => ({
+      date: p.paymentDate,
+      type: p.paymentType === "Receive" ? "Payment Received" : "Payment Paid",
+      ref: paymentRef(p),
+      id: p._id,
+      debit: p.paymentType === "Pay" ? p.amount : 0,
+      credit: p.paymentType === "Receive" ? p.amount : 0,
+      pendingAmount: null,
+    })),
   ];
 
   return { party: customer, entries };
@@ -816,15 +923,31 @@ async function loadSupplierLedgerEntries(companyId, supplierId) {
       ])
     : [];
 
-  const [purchaseReturns, openingBills] = await Promise.all([
+  const [purchaseReturns, openingBills, payments] = await Promise.all([
     PurchaseReturn.find({ companyId, supplierId }).select("returnNo returnDate netAmount pendingAmount").lean(),
     OpeningBill.find({ companyId, type: "purchase", supplierId }).select("billNo billDate totalAmount pendingAmount").lean(),
+    Payment.find({ companyId, partyType: "Supplier", partyId: supplierId }).select("paymentType paymentDate amount referenceNo narrations").lean(),
   ]);
 
+  // ⚠️→✅ Payment rows added for the same reason loadCustomerLedgerEntries'
+  // comment explains — a real, previously-invisible bug: paying a Supplier
+  // via the Payments page never showed up as its own row in their Ledger.
+  // "Pay" (money going out to the supplier) debits the ledger — reduces what
+  // we owe them, same direction a Purchase Return already uses. "Receive"
+  // (a refund coming back from them) credits it, same as a Purchase.
   const entries = [
     ...openingBills.map((b) => ({ date: b.billDate, type: "Opening Balance", ref: b.billNo, id: b._id, debit: 0, credit: b.totalAmount, pendingAmount: b.pendingAmount })),
     ...purchaseRows.map((p) => ({ date: p.invoiceDate, type: "Purchase", ref: p.invoiceNo, id: p._id, debit: 0, credit: p.amount, pendingAmount: null })),
     ...purchaseReturns.map((r) => ({ date: r.returnDate, type: "Purchase Return", ref: r.returnNo, id: r._id, debit: r.netAmount, credit: 0, pendingAmount: r.pendingAmount })),
+    ...payments.map((p) => ({
+      date: p.paymentDate,
+      type: p.paymentType === "Pay" ? "Payment Paid" : "Payment Received",
+      ref: paymentRef(p),
+      id: p._id,
+      debit: p.paymentType === "Pay" ? p.amount : 0,
+      credit: p.paymentType === "Receive" ? p.amount : 0,
+      pendingAmount: null,
+    })),
   ];
 
   return { party: supplier, entries };
@@ -1601,6 +1724,17 @@ const exportSaleReturnReport = async (req, res) => {
   }
 };
 
+// The same "phone · city · GST: xxx" subtitle line both Ledger pages render
+// under the party's name — mirrored here so the PDF's header matches the
+// on-screen page exactly, not just the table below it.
+function partySubtitle(party) {
+  const parts = [];
+  if (party.phone) parts.push(party.phone);
+  if (party.city) parts.push(party.city);
+  if (party.gstNo) parts.push(`GST: ${party.gstNo}`);
+  return parts.join(" · ");
+}
+
 // Shared Excel shape for both ledgers — an opening-balance row (only when a
 // dateFrom filter is active, mirroring the frontend's own display rule)
 // followed by every dated entry.
@@ -1654,7 +1788,28 @@ const exportCustomerLedger = async (req, res) => {
 
     const format = req.query.format || "excel";
     if (format === "pdf") {
-      await sendPdfFile(res, `Customer Ledger: ${loaded.party.name}`, ledgerExcelColumns(), rows, `${safeName}_Ledger.pdf`);
+      // Same card figures as customers/ledger/[id]/page.tsx's own
+      // totalSales/totalReceived — Sale Return rows deliberately excluded,
+      // same rationale as the on-screen cards (see that page's comment).
+      const totalSales = ledger.entries.filter((e) => e.type === "Sale").reduce((s, e) => s + (e.debit || 0), 0);
+      const totalReceived = ledger.entries.filter((e) => e.type === "Payment Received").reduce((s, e) => s + (e.credit || 0), 0);
+      const closing = ledger.closingBalance;
+      await sendLedgerPdf(res, {
+        title: `${loaded.party.name} — Ledger`,
+        subtitle: partySubtitle(loaded.party),
+        cards: [
+          { label: "Total Sales", value: `Rs.${totalSales.toFixed(2)}` },
+          { label: "Total Received", value: `Rs.${totalReceived.toFixed(2)}`, color: "#15803d" },
+          {
+            label: "Closing Balance",
+            value: closing < 0 ? `Rs.${Math.abs(closing).toFixed(2)} Advance` : `Rs.${closing.toFixed(2)} Receivable`,
+            color: closing < 0 ? "#15803d" : "#dc2626",
+          },
+        ],
+        columns: ledgerExcelColumns(),
+        records: rows,
+        filename: `${safeName}_Ledger.pdf`,
+      });
     } else {
       await sendExcelFile(res, "Customer Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);
     }
@@ -1686,7 +1841,28 @@ const exportSupplierLedger = async (req, res) => {
 
     const format = req.query.format || "excel";
     if (format === "pdf") {
-      await sendPdfFile(res, `Supplier Ledger: ${loaded.party.name}`, ledgerExcelColumns(), rows, `${safeName}_Ledger.pdf`);
+      // Same card figures as suppliers/ledger/[id]/page.tsx's own
+      // totalPurchases/totalPaid — Purchase Return rows deliberately
+      // excluded, same rationale as the on-screen cards (see that page).
+      const totalPurchases = ledger.entries.filter((e) => e.type === "Purchase").reduce((s, e) => s + (e.credit || 0), 0);
+      const totalPaid = ledger.entries.filter((e) => e.type === "Payment Paid").reduce((s, e) => s + (e.debit || 0), 0);
+      const closing = ledger.closingBalance;
+      await sendLedgerPdf(res, {
+        title: `${loaded.party.name} — Ledger`,
+        subtitle: partySubtitle(loaded.party),
+        cards: [
+          { label: "Total Purchases", value: `Rs.${totalPurchases.toFixed(2)}` },
+          { label: "Total Paid", value: `Rs.${totalPaid.toFixed(2)}`, color: "#15803d" },
+          {
+            label: "Closing Balance",
+            value: closing < 0 ? `Rs.${Math.abs(closing).toFixed(2)} Advance` : `Rs.${closing.toFixed(2)} Payable`,
+            color: closing < 0 ? "#15803d" : "#dc2626",
+          },
+        ],
+        columns: ledgerExcelColumns(),
+        records: rows,
+        filename: `${safeName}_Ledger.pdf`,
+      });
     } else {
       await sendExcelFile(res, "Supplier Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);
     }

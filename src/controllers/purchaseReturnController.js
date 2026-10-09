@@ -2,10 +2,32 @@ const PurchaseReturn = require("../models/PurchaseReturn");
 const Purchase = require("../models/Purchase");
 const Item = require("../models/Item");
 const Godown = require("../models/Godown");
-const Payment = require("../models/Payment");
 const BankAccount = require("../models/BankAccount");
+const Narration = require("../models/Narration");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+
+async function resolveNarrations(clientNarrations, companyId) {
+  if (!Array.isArray(clientNarrations) || clientNarrations.length === 0) return [];
+  const isStringArray = typeof clientNarrations[0] === 'string' || clientNarrations[0] instanceof String;
+  const ids = isStringArray ? clientNarrations : clientNarrations.map(n => n.narrationId || n._id);
+
+  const docs = await Narration.find({ _id: { $in: ids }, companyId }).lean();
+  const byId = new Map(docs.map((d) => [String(d._id), d]));
+
+  return clientNarrations
+    .map((cn) => {
+      const id = isStringArray ? cn : (cn.narrationId || cn._id);
+      const d = byId.get(String(id));
+      if (!d) return null;
+      return {
+        narrationId: d._id,
+        type: d.type,
+        code: isStringArray ? d.code : (cn.code !== undefined ? cn.code : d.code)
+      };
+    })
+    .filter(Boolean);
+}
 
 // Identical to purchaseController.findMatchedRateEntry — MRP is the identity key.
 function findMatchedRateEntry(raw, item) {
@@ -274,6 +296,7 @@ async function createInvoicePayment({ companyId, invoiceId, invoiceType, invoice
     amount,
     notes: `${noteVerb} ${invoiceType} ${invoiceNo}`,
     allocations: [{ invoiceId, invoiceType, allocatedAmount: amount }],
+    narrations: arguments[0].narrations || [],
   });
 }
 
@@ -438,6 +461,7 @@ const createPurchaseReturn = async (req, res) => {
       dueDate,
       paymentMode,
       bankAccountId,
+      narrationIds,
     } = req.body;
 
     if (!companyId || !returnNo || !returnDate || !supplierId) {
@@ -475,6 +499,7 @@ const createPurchaseReturn = async (req, res) => {
       paymentMode,
       bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
       dueDate: dueDate || null,
+      narrations: narrationIds ? await resolveNarrations(narrationIds, companyId) : [],
     });
 
     // Payment creation and the stock effect are both wrapped in the SAME try/catch —
@@ -498,6 +523,7 @@ const createPurchaseReturn = async (req, res) => {
           bankAccountId,
           amount: refund,
           noteVerb: "Refund for",
+          narrations: purchaseReturn.narrations,
         });
       }
       await applyStockDelta(lines, -1, companyId);
@@ -529,6 +555,7 @@ const updatePurchaseReturn = async (req, res) => {
     const oldSupplierId = purchaseReturn.supplierId;
     const oldReturnNo = purchaseReturn.returnNo;
     const oldReturnDate = purchaseReturn.returnDate;
+    const oldNarrations = purchaseReturn.narrations;
 
     const {
       returnNo,
@@ -542,6 +569,7 @@ const updatePurchaseReturn = async (req, res) => {
       dueDate,
       paymentMode,
       bankAccountId,
+      narrationIds,
     } = req.body;
 
     if (returnNo && returnNo.trim() !== purchaseReturn.returnNo) {
@@ -591,6 +619,9 @@ const updatePurchaseReturn = async (req, res) => {
       if (usesBankAccount(paymentMode)) purchaseReturn.bankAccountId = bankAccountId;
       else if (paymentMode) purchaseReturn.bankAccountId = null;
       if (dueDate !== undefined) purchaseReturn.dueDate = dueDate || null;
+      if (narrationIds !== undefined) {
+        purchaseReturn.narrations = await resolveNarrations(narrationIds, companyId);
+      }
 
       // Field mutation + save + reapply must all succeed together, or the reversal
       // above must be undone — see saleController.updateSale for the failure mode
@@ -612,6 +643,7 @@ const updatePurchaseReturn = async (req, res) => {
           bankAccountId: purchaseReturn.bankAccountId,
           amount: refund,
           noteVerb: "Refund for",
+          narrations: purchaseReturn.narrations,
         });
       }
     } catch (err) {
@@ -630,6 +662,7 @@ const updatePurchaseReturn = async (req, res) => {
           bankAccountId: oldBankAccountId,
           amount: oldRefundAmount,
           noteVerb: "Refund for",
+          narrations: oldNarrations,
         }).catch(() => {});
       }
       throw err;

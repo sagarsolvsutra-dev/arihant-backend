@@ -1,5 +1,16 @@
 const mongoose = require("mongoose");
 
+// Snapshotted (type+code copied, not a live reference) — see Expense.js's
+// identical NarrationRefSchema comment for why.
+const NarrationRefSchema = new mongoose.Schema(
+  {
+    narrationId: { type: mongoose.Schema.Types.ObjectId, ref: "Narration", default: null },
+    type: { type: String, required: true },
+    code: { type: String, required: true },
+  },
+  { _id: false }
+);
+
 const BankTransferSchema = new mongoose.Schema(
   {
     companyId: {
@@ -19,8 +30,7 @@ const BankTransferSchema = new mongoose.Schema(
       required: true,
     },
     amount: { type: Number, required: true, min: 0.01 },
-    referenceNo: { type: String, default: "", trim: true },
-    notes: { type: String, default: "", trim: true },
+    narrations: { type: [NarrationRefSchema], default: [] },
   },
   {
     timestamps: true,

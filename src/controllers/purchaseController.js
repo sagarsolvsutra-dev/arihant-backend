@@ -3,8 +3,31 @@ const Item = require("../models/Item");
 const Godown = require("../models/Godown");
 const Payment = require("../models/Payment");
 const BankAccount = require("../models/BankAccount");
+const Narration = require("../models/Narration");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+
+async function resolveNarrations(clientNarrations, companyId) {
+  if (!Array.isArray(clientNarrations) || clientNarrations.length === 0) return [];
+  const isStringArray = typeof clientNarrations[0] === 'string' || clientNarrations[0] instanceof String;
+  const ids = isStringArray ? clientNarrations : clientNarrations.map(n => n.narrationId || n._id);
+
+  const docs = await Narration.find({ _id: { $in: ids }, companyId }).lean();
+  const byId = new Map(docs.map((d) => [String(d._id), d]));
+
+  return clientNarrations
+    .map((cn) => {
+      const id = isStringArray ? cn : (cn.narrationId || cn._id);
+      const d = byId.get(String(id));
+      if (!d) return null;
+      return {
+        narrationId: d._id,
+        type: d.type,
+        code: isStringArray ? d.code : (cn.code !== undefined ? cn.code : d.code)
+      };
+    })
+    .filter(Boolean);
+}
 
 // Finds which of the item's mrpEntries the client is purchasing against, by
 // matching on MRP (guaranteed unique per item) — never trusts client-supplied
@@ -365,6 +388,7 @@ async function createInvoicePayment({ companyId, invoiceId, invoiceType, invoice
     amount,
     notes: `${noteVerb} ${invoiceType} Invoice ${invoiceNo}`,
     allocations: [{ invoiceId, invoiceType, allocatedAmount: amount }],
+    narrations: arguments[0].narrations || [],
   });
 }
 
@@ -425,7 +449,7 @@ const getPurchaseById = async (req, res) => {
 const createPurchase = async (req, res) => {
   let purchase;
   try {
-    const { companyId, invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate, paymentMode, bankAccountId } = req.body;
+    const { companyId, invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate, paymentMode, bankAccountId, narrationIds } = req.body;
 
     if (!companyId || !invoiceNo || !invoiceDate) {
       return res.status(400).json({ message: "Please provide all required fields" });
@@ -454,6 +478,7 @@ const createPurchase = async (req, res) => {
       paymentMode,
       bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
       dueDate: dueDate || null,
+      narrations: narrationIds ? await resolveNarrations(narrationIds, companyId) : [],
     });
 
     // Payment creation and the stock effect are both wrapped in the SAME try/catch —
@@ -480,6 +505,7 @@ const createPurchase = async (req, res) => {
           bankAccountId,
           amount: paid,
           noteVerb: "Advance for",
+          narrations: purchase.narrations,
         });
       }
       await applyStockDelta(lines, 1, companyId);
@@ -511,8 +537,9 @@ const updatePurchase = async (req, res) => {
     const oldBankAccountId = purchase.bankAccountId;
     const oldInvoiceNo = purchase.invoiceNo;
     const oldInvoiceDate = purchase.invoiceDate;
+    const oldNarrations = purchase.narrations;
 
-    const { invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate, paymentMode, bankAccountId } = req.body;
+    const { invoiceNo, invoiceDate, receivingDate, ewayBillNo, notes, items, paidAmount, dueDate, paymentMode, bankAccountId, narrationIds } = req.body;
 
     if (invoiceNo && invoiceNo.trim() !== purchase.invoiceNo) {
       const exists = await Purchase.findOne({
@@ -558,6 +585,9 @@ const updatePurchase = async (req, res) => {
       if (usesBankAccount(paymentMode)) purchase.bankAccountId = bankAccountId;
       else if (paymentMode) purchase.bankAccountId = null;
       if (dueDate !== undefined) purchase.dueDate = dueDate || null;
+      if (narrationIds !== undefined) {
+        purchase.narrations = await resolveNarrations(narrationIds, companyId);
+      }
 
       // The field mutation + save + reapply must all succeed together, or the
       // reversal above must be undone — otherwise a validation/cast error thrown by
@@ -582,6 +612,7 @@ const updatePurchase = async (req, res) => {
           bankAccountId: purchase.bankAccountId,
           amount: paid,
           noteVerb: "Advance for",
+          narrations: purchase.narrations,
         });
       }
     } catch (err) {
@@ -603,6 +634,7 @@ const updatePurchase = async (req, res) => {
           bankAccountId: oldBankAccountId,
           amount: oldPaidAmount,
           noteVerb: "Advance for",
+          narrations: oldNarrations,
         }).catch(() => {});
       }
       throw err;
