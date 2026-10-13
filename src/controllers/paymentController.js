@@ -2,10 +2,29 @@ const Payment = require("../models/Payment");
 const Sale = require("../models/Sale");
 const Purchase = require("../models/Purchase");
 const Item = require("../models/Item");
+const Customer = require("../models/Customer");
+const Supplier = require("../models/Supplier");
 const BankAccount = require("../models/BankAccount");
 const Narration = require("../models/Narration");
 const { isValidObjectId } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+
+// partyId is only ever a real Customer/Supplier when it came from the /payments
+// page itself (see DERIVED_PARTY_TYPES below for the two other partyTypes that
+// bypass this entirely) — without this check a caller could point partyId at
+// another company's real Customer/Supplier _id and have it populate straight
+// into this company's own Payments list (getPayments' .populate("partyId", ...)),
+// a cross-tenant information leak even though no balance actually moves.
+async function assertPartyBelongsToCompany(partyType, partyId, companyId) {
+  if (partyType === "Customer") {
+    const exists = await Customer.exists({ _id: partyId, companyId });
+    if (!exists) return "Invalid Customer — not found in this company";
+  } else if (partyType === "Supplier") {
+    const exists = await Supplier.exists({ _id: partyId, companyId });
+    if (!exists) return "Invalid Supplier — not found in this company";
+  }
+  return null;
+}
 
 // Resolves client-submitted Narration ids against the company's own Narration
 // master and snapshots {narrationId, type, code} — see Expense.js's
@@ -175,7 +194,7 @@ async function reversePaymentEffects(payment) {
 
 exports.createPayment = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const {
       paymentDate,
       paymentType,
@@ -204,6 +223,11 @@ exports.createPayment = async (req, res) => {
       if (paymentType === "Pay" && (bank.currentBalance || 0) < parsedAmount) {
         return res.status(400).json({ message: "Insufficient funds in Bank Account" });
       }
+    }
+
+    const partyError = await assertPartyBelongsToCompany(partyType, partyId, companyId);
+    if (partyError) {
+      return res.status(400).json({ message: partyError });
     }
 
     // Before the Payment document exists and before any balance moves — a
@@ -251,7 +275,7 @@ exports.createPayment = async (req, res) => {
 
 exports.getPayments = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const { type } = req.query; // 'Receive' or 'Pay'
 
     const filter = { companyId };
@@ -273,7 +297,7 @@ exports.getPayments = async (req, res) => {
 
 exports.getPaymentById = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const payment = await Payment.findOne({ _id: req.params.id, companyId });
     if (!payment) return res.status(404).json({ message: "Payment not found" });
     res.status(200).json({ payment });
@@ -284,7 +308,7 @@ exports.getPaymentById = async (req, res) => {
 
 exports.updatePayment = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const existing = await Payment.findOne({ _id: req.params.id, companyId });
     if (!existing) return res.status(404).json({ message: "Payment not found" });
     if (DERIVED_PARTY_TYPES[existing.partyType]) {
@@ -325,6 +349,11 @@ exports.updatePayment = async (req, res) => {
       if (!bank) return res.status(404).json({ message: "Bank account not found" });
     }
 
+    const partyError = await assertPartyBelongsToCompany(partyType, partyId, companyId);
+    if (partyError) {
+      return res.status(400).json({ message: partyError });
+    }
+
     // Judged against each invoice's pending balance WITH this payment's own old
     // allocation added back (see validateAllocations) — and, like the bank check
     // above, before the reversal below has touched anything, so a refused edit
@@ -345,6 +374,31 @@ exports.updatePayment = async (req, res) => {
     // to) left the Sale/Purchase's receivedAmount/paidAmount and the bank balance
     // permanently out of sync with what the payment record actually says.
     await reversePaymentEffects(existing);
+
+    // createPayment refuses a "Pay" that the bank can't cover BEFORE anything
+    // is created; this update path had no equivalent — increasing a "Pay"
+    // payment's amount (or switching Cash/UPI/Cheque to Bank) could silently
+    // drive currentBalance negative with no check at all. Judged post-reversal
+    // (the bank the OLD amount was just credited back to, which may be the
+    // same account the NEW amount is about to debit), mirroring
+    // expenseController.updateExpense's identical fix for the same bug class.
+    if (usesBankAccount(paymentMode) && paymentType === "Pay") {
+      const freshBank = await BankAccount.findById(bankAccountId);
+      if ((freshBank?.currentBalance || 0) < parsedAmount) {
+        // Undo the reversal above — re-apply the OLD payment's effects so a
+        // refused edit leaves everything exactly as it was before this request.
+        await applyPaymentEffects({
+          companyId: existing.companyId,
+          partyType: existing.partyType,
+          paymentType: existing.paymentType,
+          paymentMode: existing.paymentMode,
+          bankAccountId: existing.bankAccountId,
+          amount: existing.amount,
+          allocations: existing.allocations,
+        }).catch(() => {});
+        return res.status(400).json({ message: "Insufficient funds in Bank Account" });
+      }
+    }
 
     try {
       await applyPaymentEffects({ companyId, partyType, paymentType, paymentMode, bankAccountId, amount: parsedAmount, allocations });
@@ -391,7 +445,7 @@ exports.updatePayment = async (req, res) => {
 
 exports.deletePayment = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const payment = await Payment.findOne({ _id: req.params.id, companyId });
     if (!payment) return res.status(404).json({ message: "Payment not found" });
     if (DERIVED_PARTY_TYPES[payment.partyType]) {
@@ -414,7 +468,7 @@ exports.deletePayment = async (req, res) => {
 
 exports.getPendingInvoices = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const { partyType, partyId } = req.params;
 
     let invoices = [];

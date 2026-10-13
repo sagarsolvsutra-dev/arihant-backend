@@ -100,7 +100,7 @@ const createExpense = async (req, res) => {
     }
 
     const expenseAmount = Number(amount);
-    if (expenseAmount <= 0) {
+    if (!(expenseAmount > 0)) {
       return res.status(400).json({ message: "Amount must be greater than 0" });
     }
 
@@ -227,7 +227,7 @@ const updateExpense = async (req, res) => {
     const { companyId, title, category, expenseDate, amount, paymentMode, bankAccountId, accountId, narrationIds, referenceNo, notes } = req.body;
     
     const newAmount = Number(amount);
-    if (newAmount <= 0) {
+    if (!(newAmount > 0)) {
       return res.status(400).json({ message: "Amount must be greater than 0" });
     }
 
@@ -248,6 +248,30 @@ const updateExpense = async (req, res) => {
     }
     if (expense.accountId) {
       await reverseAccountEffect(expense.accountId, expense.amount, "Dr", expense.companyId);
+    }
+
+    // Unlike createExpense (which checks the bank can absorb the debit BEFORE
+    // creating anything), this update path previously had no equivalent check
+    // at all — only confirming the bank account exists, never that it can
+    // actually cover the new (possibly larger, possibly newly-bank-mode)
+    // amount. An edit that increases the amount or switches Cash→Bank could
+    // silently drive currentBalance negative. Checked post-reversal (the bank
+    // the OLD amount was just credited back to, which may be the same account
+    // the NEW amount is about to debit), mirroring bankTransferController's
+    // own reverse-then-validate-then-apply order.
+    if (usesBankAccount(paymentMode)) {
+      const freshBank = await BankAccount.findById(bankAccountId);
+      if ((freshBank?.currentBalance || 0) < newAmount) {
+        // Undo the reversal above before refusing — this request must leave
+        // the original expense's effects exactly as they were.
+        if (usesBankAccount(expense.paymentMode) && expense.bankAccountId) {
+          await BankAccount.findByIdAndUpdate(expense.bankAccountId, { $inc: { currentBalance: -expense.amount } });
+        }
+        if (expense.accountId) {
+          await applyAccountEffect(expense.accountId, expense.amount, "Dr", expense.companyId);
+        }
+        return res.status(400).json({ message: "Insufficient balance in selected Bank Account" });
+      }
     }
 
     // 2. Apply new effects

@@ -23,13 +23,27 @@ exports.lookupGstin = async (req, res) => {
       return res.status(503).json({ message: "GST lookup isn't configured yet — add GSTINAPI_KEY to the backend .env" });
     }
 
+    // A hung upstream connection must not hang this request (and the
+    // browser's loading spinner) indefinitely — the original version had no
+    // deadline at all, unlike mailer.js's own deliberate response-budget
+    // pattern for the identical "slow 3rd party" problem.
+    const GST_LOOKUP_TIMEOUT_MS = 8000;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), GST_LOOKUP_TIMEOUT_MS);
+
     let upstream;
     try {
       upstream = await fetch(`${GSTINAPI_BASE_URL}/${gstin}`, {
         headers: { "x-api-key": apiKey },
+        signal: controller.signal,
       });
     } catch (networkErr) {
+      if (networkErr.name === "AbortError") {
+        return res.status(504).json({ message: "GST verification service took too long to respond" });
+      }
       return res.status(502).json({ message: "Could not reach the GST verification service" });
+    } finally {
+      clearTimeout(timeout);
     }
 
     const body = await upstream.json().catch(() => null);

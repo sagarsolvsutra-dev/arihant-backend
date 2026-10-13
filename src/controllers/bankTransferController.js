@@ -148,7 +148,8 @@ const createBankTransfer = async (req, res) => {
       amount: transferAmount,
       referenceNo: referenceNo || "",
       notes: `Bank Transfer Out: ${notes || ""}`,
-      allocations: []
+      allocations: [],
+      sourceTransferId: transfer._id,
     });
 
     // Create Payment for Destination (Money In)
@@ -163,7 +164,8 @@ const createBankTransfer = async (req, res) => {
       amount: transferAmount,
       referenceNo: referenceNo || "",
       notes: `Bank Transfer In: ${notes || ""}`,
-      allocations: []
+      allocations: [],
+      sourceTransferId: transfer._id,
     });
 
     res.status(201).json(transfer);
@@ -181,18 +183,26 @@ const deleteBankTransfer = async (req, res) => {
     await BankAccount.findByIdAndUpdate(transfer.fromBankId, { $inc: { currentBalance: transfer.amount } });
     await BankAccount.findByIdAndUpdate(transfer.toBankId, { $inc: { currentBalance: -transfer.amount } });
 
-    // Delete Payments matching this transfer
-    // Since there are two payments created simultaneously for this transfer on the same date with the same reference/amount
-    // We can delete them. However, since we don't store transfer._id on the payments directly, we can match by amount/date/banks
-    await Payment.deleteMany({
-      companyId: transfer.companyId,
-      paymentDate: transfer.transferDate,
-      amount: transfer.amount,
-      $or: [
-        { bankAccountId: transfer.fromBankId, partyId: transfer.toBankId, paymentType: "Pay" },
-        { bankAccountId: transfer.toBankId, partyId: transfer.fromBankId, paymentType: "Receive" }
-      ]
-    });
+    // Delete the 2 shadow Payments this transfer minted. Precise match via
+    // sourceTransferId for any transfer created after that field existed;
+    // legacy transfers (created before this fix) fall back to the old
+    // {date, amount, bank-pair} heuristic — fragile against two coincidentally
+    // identical transfers, but only ever reached for pre-existing data.
+    const linkedByRef = await Payment.find({ companyId: transfer.companyId, sourceTransferId: transfer._id }).select("_id");
+    if (linkedByRef.length > 0) {
+      await Payment.deleteMany({ _id: { $in: linkedByRef.map((p) => p._id) } });
+    } else {
+      await Payment.deleteMany({
+        companyId: transfer.companyId,
+        paymentDate: transfer.transferDate,
+        amount: transfer.amount,
+        sourceTransferId: null,
+        $or: [
+          { bankAccountId: transfer.fromBankId, partyId: transfer.toBankId, paymentType: "Pay" },
+          { bankAccountId: transfer.toBankId, partyId: transfer.fromBankId, paymentType: "Receive" }
+        ]
+      });
+    }
 
     await transfer.deleteOne();
     res.status(200).json({ message: "Transfer deleted successfully" });
@@ -217,8 +227,8 @@ const updateBankTransfer = async (req, res) => {
       return res.status(400).json({ message: "Source and destination banks cannot be the same" });
     }
 
-    const newFromBank = await BankAccount.findById(fromBankId);
-    const newToBank = await BankAccount.findById(toBankId);
+    const newFromBank = await BankAccount.findOne({ _id: fromBankId, companyId: req.effectiveCompanyId });
+    const newToBank = await BankAccount.findOne({ _id: toBankId, companyId: req.effectiveCompanyId });
 
     if (!newFromBank || !newToBank) {
       return res.status(404).json({ message: "Bank account not found" });
@@ -259,47 +269,71 @@ const updateBankTransfer = async (req, res) => {
 
     await transfer.save();
 
-    // 4. Update the related Payment records
-    // We update all matching payments for this transfer
-    await Payment.updateMany({
-      companyId: transfer.companyId,
-      paymentDate: oldDate,
-      amount: oldAmount,
-      $or: [
-        { bankAccountId: oldFromBank, partyId: oldToBank, paymentType: "Pay" },
-        { bankAccountId: oldToBank, partyId: oldFromBank, paymentType: "Receive" }
-      ]
-    }, {
-      $set: { 
+    // 4. Update the related Payment records — precise match via
+    // sourceTransferId where available (see deleteBankTransfer's identical
+    // comment), falling back to the old heuristic only for legacy transfers.
+    const linkedByRef = await Payment.find({ companyId: transfer.companyId, sourceTransferId: transfer._id });
+    if (linkedByRef.length > 0) {
+      for (const p of linkedByRef) {
+        const isPayLeg = p.paymentType === "Pay";
+        await Payment.updateOne(
+          { _id: p._id },
+          {
+            $set: {
+              paymentDate: date,
+              amount: newAmount,
+              notes: notes || "",
+              referenceNo: referenceNo || "",
+              bankAccountId: isPayLeg ? fromBankId : toBankId,
+              partyId: isPayLeg ? toBankId : fromBankId,
+            },
+          }
+        );
+      }
+    } else {
+      await Payment.updateMany({
+        companyId: transfer.companyId,
+        paymentDate: oldDate,
+        amount: oldAmount,
+        sourceTransferId: null,
+        $or: [
+          { bankAccountId: oldFromBank, partyId: oldToBank, paymentType: "Pay" },
+          { bankAccountId: oldToBank, partyId: oldFromBank, paymentType: "Receive" }
+        ]
+      }, {
+        $set: {
+          paymentDate: date,
+          amount: newAmount,
+          notes: notes || "",
+          referenceNo: referenceNo || "",
+        }
+      });
+
+      // Also update bank references in the payments since fromBank/toBank might have changed
+      await Payment.updateMany({
+        companyId: transfer.companyId,
         paymentDate: date,
         amount: newAmount,
-        notes: notes || "",
-        referenceNo: referenceNo || ""
-      }
-    });
+        sourceTransferId: null,
+        bankAccountId: oldFromBank,
+        partyId: oldToBank,
+        paymentType: "Pay"
+      }, {
+        $set: { bankAccountId: fromBankId, partyId: toBankId }
+      });
 
-    // Also update bank references in the payments since fromBank/toBank might have changed
-    await Payment.updateMany({
-      companyId: transfer.companyId,
-      paymentDate: date,
-      amount: newAmount,
-      bankAccountId: oldFromBank,
-      partyId: oldToBank,
-      paymentType: "Pay"
-    }, {
-      $set: { bankAccountId: fromBankId, partyId: toBankId }
-    });
-
-    await Payment.updateMany({
-      companyId: transfer.companyId,
-      paymentDate: date,
-      amount: newAmount,
-      bankAccountId: oldToBank,
-      partyId: oldFromBank,
-      paymentType: "Receive"
-    }, {
-      $set: { bankAccountId: toBankId, partyId: fromBankId }
-    });
+      await Payment.updateMany({
+        companyId: transfer.companyId,
+        paymentDate: date,
+        amount: newAmount,
+        sourceTransferId: null,
+        bankAccountId: oldToBank,
+        partyId: oldFromBank,
+        paymentType: "Receive"
+      }, {
+        $set: { bankAccountId: toBankId, partyId: fromBankId }
+      });
+    }
 
 
     res.status(200).json(transfer);

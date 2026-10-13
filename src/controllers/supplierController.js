@@ -73,6 +73,9 @@ const createSupplier = async (req, res) => {
     if (!companyId || !name) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
+    if (creditDays !== undefined && parseInt(creditDays) < 0) {
+      return res.status(400).json({ message: "Credit Days cannot be negative" });
+    }
 
     // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
     await assertRefBelongsToCompany(SupplierGroup, supplierGroupId, companyId, "Supplier Group");
@@ -152,7 +155,10 @@ const updateSupplier = async (req, res) => {
       supplier.supplierGroupId = supplierGroupId;
     }
     if (balanceMethod !== undefined) supplier.balanceMethod = balanceMethod;
-    if (creditDays !== undefined) supplier.creditDays = parseInt(creditDays) || 0;
+    if (creditDays !== undefined) {
+      if (parseInt(creditDays) < 0) throw new Error("Credit Days cannot be negative");
+      supplier.creditDays = parseInt(creditDays) || 0;
+    }
     if (isActive !== undefined) supplier.isActive = isActive;
 
     await supplier.save();

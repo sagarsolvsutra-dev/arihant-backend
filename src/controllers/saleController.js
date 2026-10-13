@@ -4,7 +4,8 @@ const Godown = require("../models/Godown");
 const Payment = require("../models/Payment");
 const BankAccount = require("../models/BankAccount");
 const Narration = require("../models/Narration");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const Customer = require("../models/Customer");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
 
 async function resolveNarrations(clientNarrations, companyId) {
@@ -55,7 +56,14 @@ function computeLine(raw, item) {
   const lessRs = parseFloat(raw.lessRs) || 0;
   const cdPercent = parseFloat(raw.cdPercent) || 0;
   const cdRs = parseFloat(raw.cdRs) || 0;
-  const gstPercent = parseFloat(raw.gstPercent ?? item.gstPercentage) || 0;
+  // Always derived from the server's own Item record, never the client's
+  // submitted value — matches the same 'never trust client' invariant
+  // packing/purchaseQty above already follow. Previously preferred
+  // raw.gstPercent when present, meaning a direct API call (bypassing the
+  // UI, which always sends the item's own readOnly rate) could book a line
+  // at a GST% that doesn't match the item's actual configured rate, with
+  // the server having no way to catch it.
+  const gstPercent = parseFloat(item.gstPercentage) || 0;
 
   // Never trust the client to have blocked negative input — a negative quantity or
   // rate here would silently corrupt Item stock via applyStockDelta. gstPercent was
@@ -410,6 +418,11 @@ const createSale = async (req, res) => {
     if (!companyId || !invoiceNo || !invoiceDate || !customerId) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
+    // customerId only existed for its own sake until now — a client could
+    // name another company's real Customer and have that party's name leak
+    // into this company's own Reports/Ledger exports (no stock/money harm,
+    // but a real cross-tenant information disclosure).
+    await assertRefBelongsToCompany(Customer, customerId, companyId, "Customer");
 
     const exists = await Sale.findOne({ companyId, invoiceNo: invoiceNo.trim() });
     if (exists) {
@@ -420,6 +433,9 @@ const createSale = async (req, res) => {
     await assertSufficientStock(lines, companyId);
     const totals = computeTotals(lines);
     const received = parseFloat(receivedAmount) || 0;
+    if (received < 0) {
+      return res.status(400).json({ message: "Received Amount cannot be negative" });
+    }
 
     sale = await Sale.create({
       companyId,
@@ -496,6 +512,10 @@ const updateSale = async (req, res) => {
 
     const { invoiceType, paymentType, invoiceNo, invoiceDate, deliveryDate, customerId, notes, items, receivedAmount, dueDate, paymentMode, bankAccountId, narrationIds } = req.body;
 
+    if (customerId) {
+      await assertRefBelongsToCompany(Customer, customerId, companyId, "Customer");
+    }
+
     if (invoiceNo && invoiceNo.trim() !== sale.invoiceNo) {
       const exists = await Sale.findOne({
         companyId: sale.companyId,
@@ -533,6 +553,9 @@ const updateSale = async (req, res) => {
       Object.assign(sale, totals);
 
       const received = receivedAmount !== undefined ? parseFloat(receivedAmount) || 0 : oldReceivedAmount;
+      if (received < 0) {
+        throw new Error("Received Amount cannot be negative");
+      }
       sale.receivedAmount = received;
       sale.pendingAmount = totals.netAmount - received;
       if (paymentMode !== undefined) sale.paymentMode = paymentMode;

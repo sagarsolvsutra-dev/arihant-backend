@@ -12,7 +12,10 @@ const getCustomerGroups = async (req, res) => {
 
     const query = { companyId };
     if (search) {
-      query.name = searchRegex(search);
+      // The frontend's own placeholder ("Search by group name or zone...")
+      // promises both fields — only `name` was ever actually queried.
+      const re = searchRegex(search);
+      query.$or = [{ name: re }, { zoneNo: re }];
     }
 
     const parsedPage = clampPage(page);

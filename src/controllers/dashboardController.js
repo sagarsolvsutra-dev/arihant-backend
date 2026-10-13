@@ -41,11 +41,28 @@ async function sumField(Model, match, field) {
 // endpoints... but nothing wires Dashboard to them yet") — reuses the same
 // oid()/aggregate-$match discipline reportController.js already established
 // rather than inventing a new pattern.
-async function buildCompanyDashboard(companyId) {
+async function buildCompanyDashboard(companyId, dateFrom, dateTo) {
   const companyObjectId = oid(companyId);
-  const todayStart = startOfToday();
-  const todayEnd = startOfTomorrow();
-  const todayMatch = { companyId: companyObjectId, invoiceDate: { $gte: todayStart, $lt: todayEnd } };
+  
+  // Default to last 1 month if not provided
+  let chartStartDate = startOfToday();
+  chartStartDate.setMonth(chartStartDate.getMonth() - 1);
+  if (dateFrom) {
+    chartStartDate = new Date(dateFrom);
+    chartStartDate.setHours(0, 0, 0, 0);
+  }
+
+  let todayEnd = startOfTomorrow();
+  if (dateTo) {
+    todayEnd = new Date(dateTo);
+    todayEnd.setHours(23, 59, 59, 999);
+  }
+
+  // Calculate difference in days to loop over chart data
+  const daysDiff = Math.round((todayEnd - chartStartDate) / (1000 * 60 * 60 * 24));
+  const days = daysDiff > 0 ? daysDiff : 1;
+
+  const rangeMatch = { companyId: companyObjectId, invoiceDate: { $gte: chartStartDate, $lt: todayEnd } };
 
   const [
     todaySales,
@@ -60,9 +77,18 @@ async function buildCompanyDashboard(companyId) {
     recentPurchaseReturns,
     recentSaleReturns,
     recentTransfers,
+    dueSales,
+    duePurchases,
+    dueSaleReturns,
+    duePurchaseReturns,
   ] = await Promise.all([
-    sumField(Sale, todayMatch, "netAmount"),
-    sumField(Purchase, todayMatch, "netAmount"),
+    sumField(Sale, rangeMatch, "netAmount"),
+    sumField(Purchase, rangeMatch, "netAmount"),
+    // Total Items / Total Customers are the company's whole active roster,
+    // not "created within the chart's date range" — a company with 500 items
+    // created over the years but 0 created in the chart window (defaults to
+    // the last month) must still show 500, not 0. Lifetime count, same as
+    // lowStockItems right below.
     Item.countDocuments({ companyId, isActive: true }),
     // A "low stock" item is one with a real reorder level set (minStockQty >
     // 0 — 0/unset means "not configured", the same convention Customer's
@@ -73,8 +99,13 @@ async function buildCompanyDashboard(companyId) {
       isActive: true,
       minStockQty: { $gt: 0 },
       $expr: { $lte: ["$openingStockFreshPcs", "$minStockQty"] },
-    }),
+    }), // low stock usually doesn't make sense to date filter, keep lifetime
     Customer.countDocuments({ companyId, isActive: true }),
+    // Receivable/Payable are "what's currently owed, lifetime" — the same
+    // invariant the Customer/Supplier Ledger's own Closing Balance keeps
+    // (never date-scoped). An invoice from 4 months ago with a real unpaid
+    // balance must still count here even when the chart's date range (default
+    // last 1 month) doesn't cover its invoiceDate.
     sumField(Sale, { companyId: companyObjectId }, "pendingAmount"),
     sumField(Purchase, { companyId: companyObjectId }, "pendingAmount"),
     Sale.find({ companyId })
@@ -104,6 +135,21 @@ async function buildCompanyDashboard(companyId) {
       .sort({ createdAt: -1 })
       .limit(RECENT_ACTIVITY_LIMIT)
       .select("transferNo transferDate totalQty createdAt")
+      .lean(),
+    Sale.find({ companyId, dueDate: { $lte: todayEnd }, pendingAmount: { $gt: 0 } })
+      .populate("customerId", "name")
+      .select("invoiceNo dueDate pendingAmount customerId invoiceDate")
+      .lean(),
+    Purchase.find({ companyId, dueDate: { $lte: todayEnd }, pendingAmount: { $gt: 0 } })
+      .select("invoiceNo dueDate pendingAmount invoiceDate")
+      .lean(),
+    SaleReturn.find({ companyId, dueDate: { $lte: todayEnd }, pendingAmount: { $gt: 0 } })
+      .populate("customerId", "name")
+      .select("returnNo dueDate pendingAmount customerId returnDate")
+      .lean(),
+    PurchaseReturn.find({ companyId, dueDate: { $lte: todayEnd }, pendingAmount: { $gt: 0 } })
+      .populate("supplierId", "name")
+      .select("returnNo dueDate pendingAmount supplierId returnDate")
       .lean(),
   ]);
 
@@ -155,12 +201,109 @@ async function buildCompanyDashboard(companyId) {
     .sort((a, b) => new Date(b.date) - new Date(a.date))
     .slice(0, RECENT_ACTIVITY_LIMIT);
 
+  const dueReminders = [
+    ...dueSales.map((s) => ({
+      type: "Sale",
+      refNo: s.invoiceNo,
+      partyName: s.customerId?.name || "Unknown",
+      amount: s.pendingAmount,
+      dueDate: s.dueDate,
+      id: String(s._id),
+      direction: "receive"
+    })),
+    ...duePurchases.map((p) => ({
+      type: "Purchase",
+      refNo: p.invoiceNo,
+      partyName: "Purchase Invoice",
+      amount: p.pendingAmount,
+      dueDate: p.dueDate,
+      id: String(p._id),
+      direction: "pay"
+    })),
+    ...dueSaleReturns.map((r) => ({
+      type: "SaleReturn",
+      refNo: r.returnNo,
+      partyName: r.customerId?.name || "Unknown",
+      amount: r.pendingAmount,
+      dueDate: r.dueDate,
+      id: String(r._id),
+      direction: "pay"
+    })),
+    ...duePurchaseReturns.map((r) => ({
+      type: "PurchaseReturn",
+      refNo: r.returnNo,
+      partyName: r.supplierId?.name || "Unknown",
+      amount: r.pendingAmount,
+      dueDate: r.dueDate,
+      id: String(r._id),
+      direction: "receive"
+    })),
+  ].sort((a, b) => new Date(a.dueDate) - new Date(b.dueDate));
+
+  const sevenDaysAgo = startOfToday();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
+  
+  const [recentSalesAgg, recentPurchasesAgg] = await Promise.all([
+    Sale.aggregate([
+      { $match: { companyId: companyObjectId, invoiceDate: { $gte: chartStartDate, $lt: todayEnd } } },
+      { $group: { _id: { $dateToString: { format: days > 60 ? "%Y-%m" : "%Y-%m-%d", date: "$invoiceDate" } }, totalSales: { $sum: "$netAmount" } } }
+    ]),
+    Purchase.aggregate([
+      { $match: { companyId: companyObjectId, invoiceDate: { $gte: chartStartDate, $lt: todayEnd } } },
+      { $group: { _id: { $dateToString: { format: days > 60 ? "%Y-%m" : "%Y-%m-%d", date: "$invoiceDate" } }, totalPurchases: { $sum: "$netAmount" } } }
+    ])
+  ]);
+
+  const chartData = [];
+  if (days > 60) {
+    // Group by month
+    const startMonth = new Date(chartStartDate.getFullYear(), chartStartDate.getMonth(), 1);
+    const endMonth = new Date(todayEnd.getFullYear(), todayEnd.getMonth(), 1);
+    
+    let currentMonth = new Date(startMonth);
+    while (currentMonth <= endMonth) {
+      const yearStr = currentMonth.getFullYear();
+      const monthStr = String(currentMonth.getMonth() + 1).padStart(2, '0');
+      const monthKey = `${yearStr}-${monthStr}`;
+      const displayDate = currentMonth.toLocaleDateString("en-GB", { month: "short", year: "numeric" });
+      
+      const saleObj = recentSalesAgg.find(x => x._id === monthKey);
+      const purchObj = recentPurchasesAgg.find(x => x._id === monthKey);
+      
+      chartData.push({
+        date: displayDate,
+        sales: saleObj ? saleObj.totalSales : 0,
+        purchases: purchObj ? purchObj.totalPurchases : 0
+      });
+      
+      currentMonth.setMonth(currentMonth.getMonth() + 1);
+    }
+  } else {
+    // Group by day
+    for (let i = 0; i < days; i++) {
+      const d = new Date(chartStartDate);
+      d.setDate(d.getDate() + i);
+      const tzOffset = d.getTimezoneOffset() * 60000;
+      const localISOTime = (new Date(d.getTime() - tzOffset)).toISOString().slice(0, 10);
+      const displayDate = d.toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+      
+      const saleObj = recentSalesAgg.find(x => x._id === localISOTime);
+      const purchObj = recentPurchasesAgg.find(x => x._id === localISOTime);
+      
+      chartData.push({
+        date: displayDate,
+        sales: saleObj ? saleObj.totalSales : 0,
+        purchases: purchObj ? purchObj.totalPurchases : 0
+      });
+    }
+  }
+
   return {
     kpis: {
-      todaySalesAmount: todaySales.total,
-      todaySalesCount: todaySales.count,
-      todayPurchasesAmount: todayPurchases.total,
-      todayPurchasesCount: todayPurchases.count,
+      filteredSalesAmount: todaySales.total,
+      filteredSalesCount: todaySales.count,
+      filteredPurchasesAmount: todayPurchases.total,
+      filteredPurchasesCount: todayPurchases.count,
       totalItems,
       lowStockItems,
       totalCustomers,
@@ -168,6 +311,8 @@ async function buildCompanyDashboard(companyId) {
       totalPayable: payable.total,
     },
     recentActivity,
+    dueReminders,
+    chartData,
   };
 }
 
@@ -195,11 +340,12 @@ async function buildSuperAdminDashboard() {
 // Permissions section — "Dashboard always shows").
 const getDashboard = async (req, res) => {
   try {
+    const { dateFrom, dateTo } = req.query;
     if (req.user.role === "super_admin") {
       const data = await buildSuperAdminDashboard();
       return res.status(200).json({ role: "super_admin", ...data });
     }
-    const data = await buildCompanyDashboard(req.effectiveCompanyId);
+    const data = await buildCompanyDashboard(req.effectiveCompanyId, dateFrom, dateTo);
     return res.status(200).json({ role: req.user.role, ...data });
   } catch (error) {
     console.error("Dashboard error:", error);

@@ -18,8 +18,17 @@ const getNarrations = async (req, res) => {
     const parsedLimit = clampLimit(limit);
     const skip = (parsedPage - 1) * parsedLimit;
 
-    // Seed default narrations if fetching without search
-    if (!search) {
+    // Seed default narrations ONLY the very first time (company has zero
+    // Narration docs at all) — same guard accountGroupController's own
+    // lazy-seed uses. Previously this ran on every unfiltered fetch, keyed
+    // only by `{companyId, code}` with no existence check first — so
+    // deleting a default (e.g. "Cheque"/CHQ) via the real, by-design
+    // no-reference-check deleteNarration silently didn't stick: the very
+    // next unfiltered list/attach-dropdown fetch re-inserted it via
+    // `$setOnInsert`, since that upsert's filter no longer matched anything
+    // once the row was gone.
+    const existingCount = await Narration.countDocuments({ companyId });
+    if (existingCount === 0 && !search) {
       const defaults = [
         { type: 'Accounting', code: 'AC' },
         { type: 'Cheque', code: 'CHQ' },

@@ -144,6 +144,12 @@ const createCustomer = async (req, res) => {
     if (!companyId || !name) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
+    if (creditLimit !== undefined && parseFloat(creditLimit) < 0) {
+      return res.status(400).json({ message: "Credit Limit cannot be negative" });
+    }
+    if (creditDays !== undefined && parseInt(creditDays) < 0) {
+      return res.status(400).json({ message: "Credit Days cannot be negative" });
+    }
 
     // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
     await assertRefBelongsToCompany(CustomerGroup, customerGroupId, companyId, "Customer Group");
@@ -238,8 +244,14 @@ const updateCustomer = async (req, res) => {
     }
     if (routeNo !== undefined) customer.routeNo = routeNo.trim() || "";
     if (zoneNo !== undefined) customer.zoneNo = zoneNo.trim() || "";
-    if (creditLimit !== undefined) customer.creditLimit = parseFloat(creditLimit) || 0;
-    if (creditDays !== undefined) customer.creditDays = parseInt(creditDays) || 0;
+    if (creditLimit !== undefined) {
+      if (parseFloat(creditLimit) < 0) throw new Error("Credit Limit cannot be negative");
+      customer.creditLimit = parseFloat(creditLimit) || 0;
+    }
+    if (creditDays !== undefined) {
+      if (parseInt(creditDays) < 0) throw new Error("Credit Days cannot be negative");
+      customer.creditDays = parseInt(creditDays) || 0;
+    }
     if (isActive !== undefined) customer.isActive = isActive;
 
     await customer.save();

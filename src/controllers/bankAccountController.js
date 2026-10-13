@@ -3,7 +3,7 @@ const Payment = require("../models/Payment");
 
 exports.createBankAccount = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const { bankName, accountNumber, branch, ifscCode, openingBalance, status } = req.body;
 
     const existingAccount = await BankAccount.findOne({ companyId, bankName });
@@ -32,7 +32,7 @@ exports.createBankAccount = async (req, res) => {
 
 exports.getBankAccounts = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const bankAccounts = await BankAccount.find({ companyId }).sort({ createdAt: -1 });
     res.status(200).json({ bankAccounts });
   } catch (error) {
@@ -43,7 +43,7 @@ exports.getBankAccounts = async (req, res) => {
 
 exports.updateBankAccount = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const { id } = req.params;
     const { bankName, accountNumber, branch, ifscCode, openingBalance, status } = req.body;
 
@@ -60,15 +60,24 @@ exports.updateBankAccount = async (req, res) => {
       }
     }
 
-    // Update current balance logic if opening balance changed (simplified)
-    const diff = (Number(openingBalance) || 0) - bankAccount.openingBalance;
-    bankAccount.currentBalance += diff;
+    // Only shift the balance if the caller actually sent an openingBalance —
+    // an omitted field must mean "leave it unchanged," not "treat it as 0."
+    // accountController.updateAccount already guards this identically; this
+    // function previously didn't, so a request that left openingBalance out
+    // would silently zero it out and subtract the entire original opening
+    // balance from currentBalance. Not reachable through the current Add/Edit
+    // modal (which always resends it), but a real latent gap for any direct
+    // API call or future form change that stops always-resending this field.
+    if (openingBalance !== undefined) {
+      const diff = (Number(openingBalance) || 0) - bankAccount.openingBalance;
+      bankAccount.currentBalance += diff;
+      bankAccount.openingBalance = Number(openingBalance) || 0;
+    }
 
     bankAccount.bankName = bankName;
     bankAccount.accountNumber = accountNumber;
     bankAccount.branch = branch;
     bankAccount.ifscCode = ifscCode;
-    bankAccount.openingBalance = Number(openingBalance) || 0;
     bankAccount.status = status || bankAccount.status;
 
     await bankAccount.save();
@@ -81,7 +90,7 @@ exports.updateBankAccount = async (req, res) => {
 
 exports.deleteBankAccount = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const { id } = req.params;
     
     const bankAccount = await BankAccount.findOneAndDelete({ _id: id, companyId });
@@ -98,7 +107,7 @@ exports.deleteBankAccount = async (req, res) => {
 
 exports.getBankAccountStatement = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const { id } = req.params;
     const { dateFrom, dateTo } = req.query;
 
@@ -114,11 +123,32 @@ exports.getBankAccountStatement = async (req, res) => {
       if (dateTo) filter.paymentDate.$lte = new Date(dateTo);
     }
 
+    // A genuine "balance as of dateFrom" — mirrors reportController.buildLedger's
+    // own before-range accumulation for the Customer/Supplier Ledger. Without
+    // this, applying a dateFrom filter used to seed the running balance from
+    // the account's raw, all-time openingBalance and silently ignore every
+    // payment dated before the filter — the table's own running balance would
+    // then end up understated relative to the always-live "Current Balance"
+    // KPI shown right next to it. With no dateFrom, this is identical to the
+    // raw openingBalance (nothing to fold in).
+    let openingBalanceAsOf = bankAccount.openingBalance || 0;
+    if (dateFrom) {
+      const priorPayments = await Payment.find({
+        bankAccountId: id,
+        companyId,
+        paymentDate: { $lt: new Date(dateFrom) },
+      }).select("paymentType amount");
+      for (const p of priorPayments) {
+        if (p.paymentType === "Receive") openingBalanceAsOf += p.amount;
+        else if (p.paymentType === "Pay") openingBalanceAsOf -= p.amount;
+      }
+    }
+
     const payments = await Payment.find(filter)
       .populate("partyId", "name companyName bankName accountNumber title category")
       .sort({ paymentDate: 1, createdAt: 1 });
 
-    res.status(200).json({ bankAccount, payments });
+    res.status(200).json({ bankAccount, payments, openingBalanceAsOf });
   } catch (error) {
     console.error("Error fetching bank statement:", error);
     res.status(500).json({ message: "Error fetching bank statement", error: error.message });
@@ -127,7 +157,7 @@ exports.getBankAccountStatement = async (req, res) => {
 
 exports.transferFunds = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    const companyId = req.effectiveCompanyId;
     const { fromBankId, toBankId, amount, date, notes } = req.body;
 
     if (!fromBankId || !toBankId || !amount || !date) {

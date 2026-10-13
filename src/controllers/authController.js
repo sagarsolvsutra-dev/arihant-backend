@@ -387,21 +387,51 @@ const resetPassword = async (req, res) => {
         .json({ success: false, message: "Too many wrong attempts — request a new OTP" });
     }
 
-    if (hashOtp(String(otp).trim()) !== user.resetPasswordOTP) {
-      user.resetPasswordOTPAttempts = (user.resetPasswordOTPAttempts || 0) + 1;
-      await user.save();
+    // Atomically claim one guess before even checking it, instead of the old
+    // read-then-write (`user.resetPasswordOTPAttempts += 1; await user.save()`).
+    // That pattern let concurrent requests all read the SAME starting attempts
+    // value and race on whose save "won" — only ~1 increment landed per round
+    // of N concurrent guesses instead of 1 per guess, letting an attacker who
+    // fires requests in parallel run far more than 5 real guesses against a
+    // single OTP before the stored counter ever reached the limit. The `$lt`
+    // filter makes the increment itself the gate: it only succeeds while a
+    // guess budget remains, so concurrent requests correctly serialize against
+    // each other no matter how many arrive at once — at most OTP_MAX_ATTEMPTS
+    // of them can ever win this update for a given OTP.
+    const claimed = await User.findOneAndUpdate(
+      { _id: user._id, resetPasswordOTPAttempts: { $lt: OTP_MAX_ATTEMPTS } },
+      { $inc: { resetPasswordOTPAttempts: 1 } },
+      { new: true, select: "+resetPasswordOTP +resetPasswordOTPExpires +resetPasswordOTPAttempts" }
+    );
+
+    if (!claimed) {
+      // Someone else's concurrent request (or an earlier one in this same
+      // burst) already consumed the last guess since we read `user` above.
+      await User.updateOne(
+        { _id: user._id },
+        { $unset: { resetPasswordOTP: 1, resetPasswordOTPExpires: 1 }, $set: { resetPasswordOTPAttempts: 0 } }
+      );
+      return res
+        .status(400)
+        .json({ success: false, message: "Too many wrong attempts — request a new OTP" });
+    }
+
+    if (hashOtp(String(otp).trim()) !== claimed.resetPasswordOTP) {
       return res.status(400).json({ success: false, message: "Invalid or expired OTP" });
     }
 
+    // Correct guess. This attempt was still charged against the counter by the
+    // atomic claim above (unavoidable without checking the hash inside the
+    // same update), but that's harmless — the OTP is cleared below regardless.
     // This model has no pre-save hook; every password in this codebase is hashed
     // explicitly at its call site through utils/crypto.
-    user.password = await hashPassword(newPassword);
-    // Cleared in the same save as the new password, so the code is spent whether
-    // or not the page is reloaded.
-    user.resetPasswordOTP = undefined;
-    user.resetPasswordOTPExpires = undefined;
-    user.resetPasswordOTPAttempts = 0;
-    await user.save();
+    await User.updateOne(
+      { _id: user._id },
+      {
+        $set: { password: await hashPassword(newPassword), resetPasswordOTPAttempts: 0 },
+        $unset: { resetPasswordOTP: 1, resetPasswordOTPExpires: 1 },
+      }
+    );
 
     res.json({ success: true, message: "Password reset successfully" });
   } catch (error) {

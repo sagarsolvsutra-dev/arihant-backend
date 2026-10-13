@@ -56,19 +56,35 @@ const app = express();
 // Middlewares
 app.use(helmet());
 app.use(cors({
-  origin: [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "https://arihant-frontend-seven.vercel.app",
-    "http://localhost:64992",
-    process.env.FRONTEND_URL
-  ].filter(Boolean),
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (
+      /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin) ||
+      /^https?:\/\/192\.168\.\d+\.\d+(:\d+)?$/.test(origin) ||
+      /^https?:\/\/10\.\d+\.\d+\.\d+(:\d+)?$/.test(origin)
+    ) {
+      return callback(null, true);
+    }
+
+    const envOrigins = (process.env.FRONTEND_URL || "")
+      .split(",")
+      .map((u) => u.trim().replace(/\/+$/, ""))
+      .filter(Boolean);
+
+    const allowed = [
+      "https://arihant-frontend-seven.vercel.app",
+      "http://localhost:3000",
+      "http://localhost:3001",
+      ...envOrigins,
+    ];
+
+    const cleanOrigin = origin.replace(/\/+$/, "");
+    if (allowed.includes(cleanOrigin)) {
+      return callback(null, true);
+    }
+    return callback(new Error("Not allowed by CORS"));
+  },
   credentials: true,
-  // The frontend's Excel/PDF exports now fetch()+blob() instead of
-  // window.open()'ing the file URL directly (see lib/download.ts) — that
-  // requires reading the filename back out of Content-Disposition via
-  // `response.headers.get()`, which the browser hides on cross-origin
-  // responses unless it's explicitly exposed here.
   exposedHeaders: ["Content-Disposition"],
 }));
 app.use(express.json());
@@ -103,14 +119,6 @@ app.use("/api/dashboard", protect, scopeCompany, require("./routes/dashboardRout
 // permission would wrongly block the other.
 app.use("/api/gst", protect, require("./routes/gstRoutes"));
 
-// Master Routes — each master-data resource is its OWN permission module now
-// (see utils/permissions.js's history note — this used to be one combined
-// "masters" key, split apart on direct request), but every one of them stays
-// READ-ONLY (GET stays open regardless of permission; only POST/PUT/DELETE
-// are checked) since master data is shared reference info other modules need
-// to function even without that specific module's permission (e.g. a staff
-// member with only "sale" permission still needs to read the customer list
-// to make a sale). See requirePermission's readOnly option.
 app.use("/api/item-names", protect, scopeCompany, requirePermission("itemNames", { readOnly: true }), require("./routes/itemNameRoutes"));
 app.use("/api/item-sub-groups", protect, scopeCompany, requirePermission("itemSubGroups", { readOnly: true }), require("./routes/itemSubGroupRoutes"));
 app.use("/api/customer-groups", protect, scopeCompany, requirePermission("customerGroups", { readOnly: true }), require("./routes/customerGroupRoutes"));
@@ -161,8 +169,8 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT;
 
 app.listen(PORT, () => {
-      // Pays the SMTP handshake now instead of making whoever first asks for a
-      // password reset wait for it.
-      warmUpMailer();
+  // Pays the SMTP handshake now instead of making whoever first asks for a
+  // password reset wait for it.
+  warmUpMailer();
   console.log(`🚀 Server running in ${process.env.NODE_ENV} mode on port ${PORT}`);
 });

@@ -192,13 +192,43 @@ const deleteAccount = async (req, res) => {
 
 const getAccountStatement = async (req, res) => {
   try {
-    const { companyId } = req.user;
+    // req.user.companyId is always null for super_admin — every sibling
+    // single-record handler in this file (getAccountById/updateAccount/
+    // deleteAccount) correctly uses req.effectiveCompanyId instead, which
+    // scopeCompany resolves to an explicit company or `{ $ne: null }` for
+    // that role. This one was the odd one out and always 404'd for super_admin.
+    const companyId = req.effectiveCompanyId;
     const { id } = req.params;
     const { dateFrom, dateTo } = req.query;
 
     const account = await Account.findOne({ _id: id, companyId }).populate("accountGroupId", "name");
     if (!account) {
       return res.status(404).json({ message: "Account not found" });
+    }
+
+    const Expense = require("../models/Expense");
+
+    // A genuine "balance as of dateFrom" — mirrors reportController.buildLedger's
+    // own before-range accumulation for the Customer/Supplier Ledger, and the
+    // identical fix just applied to bankAccountController.getBankAccountStatement.
+    // Without this, applying a dateFrom filter silently ignored every Expense
+    // dated before it, leaving the table's running balance out of sync with
+    // the always-live "Current Balance" KPI shown next to it.
+    let openingBalanceAsOf = account.openingBalance || 0;
+    let openingBalanceTypeAsOf = account.openingBalanceType || "Dr";
+    if (dateFrom) {
+      const toSigned = (amount, type) => (type === "Cr" ? -amount : amount);
+      let signed = toSigned(openingBalanceAsOf, openingBalanceTypeAsOf);
+      const priorExpenses = await Expense.find({
+        accountId: id,
+        companyId,
+        expenseDate: { $lt: new Date(dateFrom) },
+      }).select("amount");
+      // Expenses always post Dr to the account (see applyAccountEffect) —
+      // mirrors that same convention here rather than re-deriving it.
+      for (const e of priorExpenses) signed += e.amount;
+      openingBalanceAsOf = Math.abs(signed);
+      openingBalanceTypeAsOf = signed < 0 ? "Cr" : "Dr";
     }
 
     // Find all Expenses linked to this account
@@ -209,13 +239,12 @@ const getAccountStatement = async (req, res) => {
       if (dateTo) filter.expenseDate.$lte = new Date(dateTo);
     }
 
-    const Expense = require("../models/Expense");
     const expenses = await Expense.find(filter)
       .populate("bankAccountId", "bankName accountNumber")
       .sort({ expenseDate: 1, createdAt: 1 })
       .lean();
 
-    res.status(200).json({ account, expenses });
+    res.status(200).json({ account, expenses, openingBalanceAsOf, openingBalanceTypeAsOf });
   } catch (error) {
     res.status(500).json({ message: error.message || "Server Error" });
   }

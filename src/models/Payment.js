@@ -75,6 +75,16 @@ const PaymentSchema = new mongoose.Schema(
       default: [],
     },
     narrations: { type: [NarrationRefSchema], default: [] },
+    // Set only on the 2 shadow Payment rows a Bank Transfer mints for itself
+    // (partyType: "BankAccount") — lets bankTransferController match them back
+    // precisely on update/delete instead of a {date, amount, bank-pair} guess,
+    // which two distinct transfers of the same amount between the same two
+    // banks on the same day would otherwise collide on.
+    sourceTransferId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BankTransfer",
+      default: null,
+    },
   },
   { timestamps: true }
 );

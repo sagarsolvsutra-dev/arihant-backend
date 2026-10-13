@@ -4,7 +4,9 @@ const Item = require("../models/Item");
 const Godown = require("../models/Godown");
 const BankAccount = require("../models/BankAccount");
 const Narration = require("../models/Narration");
-const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const Payment = require("../models/Payment");
+const Customer = require("../models/Customer");
+const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
 
 async function resolveNarrations(clientNarrations, companyId) {
@@ -51,7 +53,14 @@ function computeLine(raw, item) {
   const lessRs = parseFloat(raw.lessRs) || 0;
   const cdPercent = parseFloat(raw.cdPercent) || 0;
   const cdRs = parseFloat(raw.cdRs) || 0;
-  const gstPercent = parseFloat(raw.gstPercent ?? item.gstPercentage) || 0;
+  // Always derived from the server's own Item record, never the client's
+  // submitted value — matches the same 'never trust client' invariant
+  // packing/purchaseQty above already follow. Previously preferred
+  // raw.gstPercent when present, meaning a direct API call (bypassing the
+  // UI, which always sends the item's own readOnly rate) could book a line
+  // at a GST% that doesn't match the item's actual configured rate, with
+  // the server having no way to catch it.
+  const gstPercent = parseFloat(item.gstPercentage) || 0;
 
   if (
     caseQty < 0 || pcsQty < 0 || freeQty < 0 || afterGstRate < 0 || lessRs < 0 || cdRs < 0 ||
@@ -474,6 +483,10 @@ const createSaleReturn = async (req, res) => {
     if (!companyId || !returnNo || !returnDate || !customerId) {
       return res.status(400).json({ message: "Please provide all required fields" });
     }
+    // customerId is a real, persisted field here (same as Sale's own) — a
+    // client naming another company's real Customer would leak that party's
+    // name into this company's own Reports/Ledger exports.
+    await assertRefBelongsToCompany(Customer, customerId, companyId, "Customer");
 
     const exists = await SaleReturn.findOne({ companyId, returnNo: returnNo.trim() });
     if (exists) {
@@ -489,6 +502,9 @@ const createSaleReturn = async (req, res) => {
 
     const totals = computeTotals(lines);
     const refund = parseFloat(refundAmount) || 0;
+    if (refund < 0) {
+      return res.status(400).json({ message: "Refund Amount cannot be negative" });
+    }
 
     saleReturn = await SaleReturn.create({
       companyId,
@@ -576,6 +592,10 @@ const updateSaleReturn = async (req, res) => {
       narrationIds,
     } = req.body;
 
+    if (customerId) {
+      await assertRefBelongsToCompany(Customer, customerId, companyId, "Customer");
+    }
+
     if (returnNo && returnNo.trim() !== saleReturn.returnNo) {
       const exists = await SaleReturn.findOne({
         companyId: saleReturn.companyId,
@@ -621,6 +641,9 @@ const updateSaleReturn = async (req, res) => {
       Object.assign(saleReturn, totals);
 
       const refund = refundAmount !== undefined ? parseFloat(refundAmount) || 0 : oldRefundAmount;
+      if (refund < 0) {
+        throw new Error("Refund Amount cannot be negative");
+      }
       saleReturn.refundAmount = refund;
       saleReturn.pendingAmount = totals.netAmount - refund;
       if (paymentMode !== undefined) saleReturn.paymentMode = paymentMode;

@@ -11,6 +11,8 @@ const PurchaseReturn = require("../models/PurchaseReturn");
 const SaleReturn = require("../models/SaleReturn");
 const OpeningBill = require("../models/OpeningBill");
 const Payment = require("../models/Payment");
+const Company = require("../models/Company");
+const BankAccount = require("../models/BankAccount");
 const { searchRegex, clampLimit, clampPage, isValidObjectId } = require("../utils/queryHelpers");
 
 // A report can be exported to Excel far larger than any one paginated page —
@@ -161,29 +163,245 @@ function drawSummaryCards(doc, cards, startY) {
   return startY + cardHeight + 18;
 }
 
-// The Customer/Supplier Ledger's own PDF — a dedicated renderer (not the
-// generic sendPdfFile every other report's PDF uses) specifically because the
-// on-screen Ledger page shows party contact info and 3 summary cards above
-// its table, and the exported PDF is meant to be a faithful printout of that
-// same page, not just the underlying row data. See quirk #57 for why this
-// was built: the plain title+table PDF this replaced showed none of that.
-async function sendLedgerPdf(res, { title, subtitle, cards, columns, records, filename }) {
-  const doc = new PDFDocument({ margin: 40, size: "A4", layout: "portrait" });
+function fmtTallyDate(d) {
+  if (!d) return "-";
+  const date = new Date(d);
+  if (isNaN(date.getTime())) return "-";
+  const day = date.getDate();
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const mon = months[date.getMonth()];
+  const yy = String(date.getFullYear()).slice(-2);
+  return `${day}-${mon}-${yy}`;
+}
+
+function fmtIndianNumber(num) {
+  if (num === null || num === undefined || isNaN(num) || Number(num) === 0) return "";
+  return Number(num).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+function fmtIndianTotal(num) {
+  return Number(num || 0).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+// Tally-style authentic Ledger Account PDF generator matching standard Indian accounting printouts:
+// Centered Company details, Centered Party name (bold, underlined), "Ledger Account",
+// Centered Party address, Date range, Page indicator,
+// Table with Date (with Dr/Cr indicator), Particulars, Vch Type, Vch No., Debit, Credit,
+// Subtotals, Closing Balance balancing row, and matched Grand Totals with double bottom rules.
+async function sendLedgerPdf(res, { company, party, dateFrom, dateTo, ledger, filename, isDebtor = false }) {
+  const doc = new PDFDocument({ margin: 36, size: "A4", layout: "portrait" });
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   doc.pipe(res);
 
-  doc.fontSize(18).fillColor("#000").font("Helvetica-Bold").text(title);
-  doc.font("Helvetica");
-  if (subtitle) {
-    doc.fontSize(9).fillColor("#666").text(subtitle);
+  let pageNum = 1;
+  const tableWidth = 523;
+  const startX = 36;
+  const endX = startX + tableWidth;
+
+  function renderHeader(isFirstPage) {
+    let y = 36;
+    if (isFirstPage) {
+      // Company name (Centered, uppercase, bold)
+      const compName = (company?.name || "ARIHANT ENTERPRISE").toUpperCase();
+      doc.font("Helvetica-Bold").fontSize(13).fillColor("#000").text(compName, startX, y, { width: tableWidth, align: "center" });
+      y = doc.y + 2;
+
+      // Company address lines (Centered)
+      if (company?.address) {
+        doc.font("Helvetica").fontSize(8.5).fillColor("#333").text(company.address.toUpperCase(), startX, y, { width: tableWidth, align: "center" });
+        y = doc.y + 1;
+      }
+      const compSub = [];
+      if (company?.phone) compSub.push(`PH: ${company.phone}`);
+      if (company?.gstNo) compSub.push(`GSTIN: ${company.gstNo}`);
+      if (compSub.length > 0) {
+        doc.font("Helvetica").fontSize(8).fillColor("#444").text(compSub.join("  |  "), startX, y, { width: tableWidth, align: "center" });
+        y = doc.y + 1;
+      }
+
+      y += 8;
+
+      // Party Name (Centered, uppercase, bold, underlined)
+      const partyName = (party?.name || "PARTY").toUpperCase();
+      doc.font("Helvetica-Bold").fontSize(11).fillColor("#000").text(partyName, startX, y, { width: tableWidth, align: "center", underline: true });
+      y = doc.y + 3;
+
+      doc.font("Helvetica").fontSize(9).fillColor("#333").text("Ledger Account", startX, y, { width: tableWidth, align: "center" });
+      y = doc.y + 2;
+
+      // Party address lines (Centered)
+      const partyAddrParts = [];
+      if (party?.address) partyAddrParts.push(party.address.toUpperCase());
+      if (party?.city) partyAddrParts.push(party.city.toUpperCase());
+      if (party?.state) partyAddrParts.push(party.state.toUpperCase());
+      if (party?.pincode) partyAddrParts.push(party.pincode);
+      if (partyAddrParts.length > 0) {
+        doc.font("Helvetica").fontSize(8).fillColor("#444").text(partyAddrParts.join(", "), startX, y, { width: tableWidth, align: "center" });
+        y = doc.y + 1;
+      }
+      if (party?.gstNo) {
+        doc.font("Helvetica").fontSize(8).fillColor("#444").text(`GSTIN: ${party.gstNo}`, startX, y, { width: tableWidth, align: "center" });
+        y = doc.y + 1;
+      }
+
+      y += 8;
+
+      // Date Range (Centered)
+      const fromStr = dateFrom ? fmtTallyDate(dateFrom) : (ledger.entries?.[0]?.date ? fmtTallyDate(ledger.entries[0].date) : "1-Apr-26");
+      const toStr = dateTo ? fmtTallyDate(dateTo) : (ledger.entries?.length ? fmtTallyDate(ledger.entries[ledger.entries.length - 1].date) : fmtTallyDate(new Date()));
+      doc.font("Helvetica").fontSize(8.5).fillColor("#000").text(`${fromStr} to ${toStr}`, startX, y, { width: tableWidth, align: "center" });
+      y = doc.y + 4;
+    } else {
+      // Subsequent pages header
+      const partyName = (party?.name || "PARTY").toUpperCase();
+      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000").text(`${partyName} — Ledger Account (Contd.)`, startX, y, { width: tableWidth, align: "center" });
+      y = doc.y + 6;
+    }
+
+    // Right-aligned Page Number
+    doc.font("Helvetica").fontSize(8).fillColor("#333").text(`Page ${pageNum}`, startX, y, { width: tableWidth, align: "right" });
+    y = doc.y + 4;
+
+    // Table Header horizontal top line
+    doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
+    y += 3;
+
+    // Header column names
+    doc.font("Helvetica-Bold").fontSize(8.5).fillColor("#000");
+    doc.text("Date", 36, y, { width: 74 });
+    doc.text("Particulars", 112, y, { width: 200 });
+    doc.text("Vch Type", 314, y, { width: 66 });
+    doc.text("Vch No.", 382, y, { width: 44 });
+    doc.text("Debit", 428, y, { width: 64, align: "right" });
+    doc.text("Credit", 494, y, { width: 65, align: "right" });
+
+    y += 12;
+    // Table Header horizontal bottom line
+    doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
+    y += 4;
+
+    return y;
   }
-  doc.fontSize(8).fillColor("#999").text(`Generated ${new Date().toLocaleString("en-IN")}`);
 
-  let y = doc.y + 14;
-  y = drawSummaryCards(doc, cards, y);
+  let y = renderHeader(true);
+  const bottomMargin = 45;
 
-  drawDataTable(doc, columns, records, y);
+  function checkPageBreak(neededHeight = 16) {
+    if (y + neededHeight > doc.page.height - bottomMargin) {
+      doc.addPage();
+      pageNum++;
+      y = renderHeader(false);
+    }
+  }
+
+  // Opening balance row
+  const openBal = ledger.openingBalance || 0;
+  let openDebit = 0;
+  let openCredit = 0;
+  if (isDebtor) {
+    openDebit = openBal > 0 ? openBal : 0;
+    openCredit = openBal < 0 ? Math.abs(openBal) : 0;
+  } else {
+    openDebit = openBal < 0 ? Math.abs(openBal) : 0;
+    openCredit = openBal > 0 ? openBal : 0;
+  }
+
+  const openDateStr = dateFrom ? fmtTallyDate(dateFrom) : (ledger.entries?.[0]?.date ? fmtTallyDate(ledger.entries[0].date) : "1-Apr-26");
+  const openTag = openCredit > 0 ? "Dr" : (openDebit > 0 ? "Cr" : "Dr");
+
+  if (openBal !== 0 || dateFrom) {
+    checkPageBreak(14);
+    doc.font("Helvetica").fontSize(8).fillColor("#000");
+    doc.text(`${openDateStr}  ${openTag}`, 36, y, { width: 74 });
+    doc.font("Helvetica-Bold").text("Opening Balance", 112, y, { width: 200 });
+    doc.font("Helvetica");
+    if (openDebit > 0) doc.text(fmtIndianNumber(openDebit), 428, y, { width: 64, align: "right" });
+    if (openCredit > 0) doc.text(fmtIndianNumber(openCredit), 494, y, { width: 65, align: "right" });
+    y += 13;
+  }
+
+  let totalDebit = openDebit;
+  let totalCredit = openCredit;
+
+  // Transaction rows
+  for (const entry of (ledger.entries || [])) {
+    const dVal = Number(entry.debit || 0);
+    const cVal = Number(entry.credit || 0);
+    totalDebit += dVal;
+    totalCredit += cVal;
+
+    checkPageBreak(14);
+
+    const tag = entry.opposingDrCr || (cVal > 0 ? "Dr" : "Cr");
+    const dateStr = `${fmtTallyDate(entry.date)}  ${tag}`;
+    const particularText = entry.particulars || entry.type || "-";
+    const vchType = entry.vchType || (entry.type && entry.type.includes("Payment") ? "Payment" : entry.type || "-");
+    const vchNo = entry.vchNo || entry.ref || "-";
+
+    doc.font("Helvetica").fontSize(8).fillColor("#000");
+    doc.text(dateStr, 36, y, { width: 74 });
+    doc.text(particularText, 112, y, { width: 200, ellipsis: true });
+    doc.text(vchType, 314, y, { width: 66, ellipsis: true });
+    doc.text(String(vchNo), 382, y, { width: 44, ellipsis: true });
+    if (dVal > 0) doc.text(fmtIndianNumber(dVal), 428, y, { width: 64, align: "right" });
+    if (cVal > 0) doc.text(fmtIndianNumber(cVal), 494, y, { width: 65, align: "right" });
+
+    y += 13;
+  }
+
+  // Totals & Balancing Section (requires ~45pt)
+  checkPageBreak(45);
+
+  // Subtotal top line
+  doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
+  y += 3;
+
+  // Subtotal amounts
+  doc.font("Helvetica").fontSize(8).fillColor("#000");
+  doc.text(fmtIndianTotal(totalDebit), 428, y, { width: 64, align: "right" });
+  doc.text(fmtIndianTotal(totalCredit), 494, y, { width: 65, align: "right" });
+  y += 12;
+
+  // Closing Balance row
+  const diff = Math.abs(totalCredit - totalDebit);
+  const roundedDiff = Math.round(diff * 100) / 100;
+  if (roundedDiff > 0.001) {
+    const isCreditGreater = totalCredit > totalDebit;
+    const closeTag = isCreditGreater ? "Cr" : "Dr";
+    doc.font("Helvetica-Bold").fontSize(8).fillColor("#000");
+    doc.text(`${closeTag}   Closing Balance`, 76, y, { width: 236 });
+    doc.font("Helvetica");
+    if (isCreditGreater) {
+      // Put in Debit column to balance
+      doc.text(fmtIndianTotal(diff), 428, y, { width: 64, align: "right" });
+    } else {
+      // Put in Credit column to balance
+      doc.text(fmtIndianTotal(diff), 494, y, { width: 65, align: "right" });
+    }
+    y += 12;
+  }
+
+  // Grand Total top line
+  doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
+  y += 3;
+
+  // Grand Total amounts (Identical on both sides!)
+  const maxTotal = Math.max(totalDebit, totalCredit);
+  doc.font("Helvetica-Bold").fontSize(8.5).fillColor("#000");
+  doc.text(fmtIndianTotal(maxTotal), 428, y, { width: 64, align: "right" });
+  doc.text(fmtIndianTotal(maxTotal), 494, y, { width: 65, align: "right" });
+  y += 12;
+
+  // Double bottom line
+  doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
+  doc.moveTo(startX, y + 2.5).lineTo(endX, y + 2.5).lineWidth(0.5).strokeColor("#000").stroke();
 
   doc.end();
 }
@@ -816,9 +1034,6 @@ function buildLedger(entries, dateFrom, dateTo, { debitIncreases = true } = {}) 
 // the schema until this ledger fix). "-" only when genuinely neither exists.
 function paymentRef(p) {
   if (p.referenceNo) return p.referenceNo;
-  if (Array.isArray(p.narrations) && p.narrations.length > 0) {
-    return p.narrations.map((n) => n.code).filter(Boolean).join(", ") || "-";
-  }
   return "-";
 }
 
@@ -842,28 +1057,125 @@ async function loadCustomerLedgerEntries(companyId, customerId) {
   if (!customer) return null;
 
   const [sales, saleReturns, openingBills, payments] = await Promise.all([
-    Sale.find({ companyId, customerId }).select("invoiceNo invoiceDate netAmount pendingAmount").lean(),
-    SaleReturn.find({ companyId, customerId }).select("returnNo returnDate netAmount pendingAmount").lean(),
+    Sale.find({ companyId, customerId }).select("invoiceNo invoiceDate netAmount pendingAmount narrations").lean(),
+    SaleReturn.find({ companyId, customerId }).select("returnNo returnDate netAmount pendingAmount narrations").lean(),
     OpeningBill.find({ companyId, type: "sale", customerId }).select("billNo billDate totalAmount pendingAmount").lean(),
-    Payment.find({ companyId, partyType: "Customer", partyId: customerId }).select("paymentType paymentDate amount referenceNo narrations").lean(),
+    Payment.find({ companyId, partyType: "Customer", partyId: customerId })
+      .select("paymentType paymentDate amount referenceNo narrations allocations notes bankAccountId paymentMode")
+      .populate("bankAccountId", "bankName accountNumber")
+      .lean(),
   ]);
 
+  const billMap = new Map();
+  sales.forEach((s) => billMap.set(String(s._id), { billNo: s.invoiceNo, type: "Sale", id: s._id }));
+  saleReturns.forEach((sr) => billMap.set(String(sr._id), { billNo: sr.returnNo, type: "Sale Return", id: sr._id }));
+  openingBills.forEach((ob) => billMap.set(String(ob._id), { billNo: ob.billNo, type: "Opening Balance", id: ob._id }));
+
+  const remainingIds = [];
+  for (const p of payments) {
+    for (const a of (p.allocations || [])) {
+      if (a.invoiceId && !billMap.has(String(a.invoiceId))) {
+        remainingIds.push(a.invoiceId);
+      }
+    }
+  }
+  if (remainingIds.length > 0) {
+    const extraSales = await Sale.find({ _id: { $in: remainingIds } }).select("_id invoiceNo").lean();
+    extraSales.forEach((s) => billMap.set(String(s._id), { billNo: s.invoiceNo, type: "Sale", id: s._id }));
+  }
+
   const entries = [
-    ...openingBills.map((b) => ({ date: b.billDate, type: "Opening Balance", ref: b.billNo, id: b._id, debit: b.totalAmount, credit: 0, pendingAmount: b.pendingAmount })),
-    ...sales.map((s) => ({ date: s.invoiceDate, type: "Sale", ref: s.invoiceNo, id: s._id, debit: s.netAmount, credit: 0, pendingAmount: s.pendingAmount })),
-    ...saleReturns.map((r) => ({ date: r.returnDate, type: "Sale Return", ref: r.returnNo, id: r._id, debit: 0, credit: r.netAmount, pendingAmount: r.pendingAmount })),
-    // "Receive" (money coming in from the customer) credits the ledger —
-    // reduces what they owe, the same direction a Sale Return already uses.
-    // "Pay" (a refund paid out to the customer) debits it, same as a Sale.
-    ...payments.map((p) => ({
-      date: p.paymentDate,
-      type: p.paymentType === "Receive" ? "Payment Received" : "Payment Paid",
-      ref: paymentRef(p),
-      id: p._id,
-      debit: p.paymentType === "Pay" ? p.amount : 0,
-      credit: p.paymentType === "Receive" ? p.amount : 0,
-      pendingAmount: null,
+    ...openingBills.map((b) => ({
+      date: b.billDate,
+      type: "Opening Balance",
+      particulars: "Opening Balance",
+      vchType: "",
+      vchNo: b.billNo || "-",
+      opposingDrCr: "Cr",
+      ref: b.billNo,
+      id: b._id,
+      debit: b.totalAmount,
+      credit: 0,
+      pendingAmount: b.pendingAmount,
+      narrations: [],
+      bills: [],
     })),
+    ...sales.map((s) => {
+      const narText = Array.isArray(s.narrations) && s.narrations.length > 0
+        ? s.narrations.map((n) => (typeof n === "string" ? n : n.code || n.type)).filter(Boolean).join(", ")
+        : "";
+      return {
+        date: s.invoiceDate,
+        type: "Sale",
+        particulars: narText || "Sales Account",
+        vchType: "Sale",
+        vchNo: s.invoiceNo,
+        opposingDrCr: "Cr",
+        ref: s.invoiceNo,
+        id: s._id,
+        debit: s.netAmount,
+        credit: 0,
+        pendingAmount: s.pendingAmount,
+        narrations: s.narrations || [],
+        bills: [],
+      };
+    }),
+    ...saleReturns.map((r) => ({
+      date: r.returnDate,
+      type: "Sale Return",
+      particulars: "Sale Return",
+      vchType: "Credit Note",
+      vchNo: r.returnNo,
+      opposingDrCr: "Dr",
+      ref: r.returnNo,
+      id: r._id,
+      debit: 0,
+      credit: r.netAmount,
+      pendingAmount: r.pendingAmount,
+      narrations: r.narrations || [],
+      bills: [],
+    })),
+    ...payments.map((p) => {
+      let bills = (p.allocations || [])
+        .map((a) => {
+          const match = billMap.get(String(a.invoiceId));
+          if (!match) return null;
+          return {
+            id: String(match.id),
+            billNo: match.billNo,
+            type: match.type,
+            allocatedAmount: a.allocatedAmount,
+          };
+        })
+        .filter(Boolean);
+
+      if (bills.length === 0 && p.notes) {
+        const m = p.notes.match(/Invoice\s+([A-Za-z0-9_-]+)/i);
+        if (m) {
+          const found = [...billMap.values()].find((b) => String(b.billNo) === m[1]);
+          bills = [{ id: found ? String(found.id) : null, billNo: m[1], type: "Sale", allocatedAmount: p.amount }];
+        }
+      }
+
+      const bankName = p.bankAccountId?.bankName || (p.paymentMode === "Cash" ? "Cash" : "Bank");
+      const isReceive = p.paymentType === "Receive";
+
+      return {
+        date: p.paymentDate,
+        type: isReceive ? "Payment Received" : "Payment Paid",
+        particulars: bankName || (isReceive ? "Receipt" : "Payment"),
+        vchType: isReceive ? "Receipt" : "Payment",
+        vchNo: paymentRef(p),
+        opposingDrCr: isReceive ? "Dr" : "Cr",
+        ref: paymentRef(p),
+        id: p._id,
+        debit: !isReceive ? p.amount : 0,
+        credit: isReceive ? p.amount : 0,
+        pendingAmount: null,
+        narrations: p.narrations || [],
+        bills,
+      };
+    }),
   ];
 
   return { party: customer, entries };
@@ -892,7 +1204,16 @@ const getCustomerLedger = async (req, res) => {
     const customer = loaded.party;
 
     res.status(200).json({
-      party: { id: customer._id, name: customer.name, phone: customer.phone, gstNo: customer.gstNo, city: customer.city },
+      party: {
+        id: customer._id,
+        name: customer.name,
+        phone: customer.phone,
+        gstNo: customer.gstNo,
+        city: customer.city,
+        address: customer.address,
+        state: customer.state,
+        pincode: customer.pincode,
+      },
       ...ledger,
     });
   } catch (error) {
@@ -918,36 +1239,131 @@ async function loadSupplierLedgerEntries(companyId, supplierId) {
             invoiceNo: { $first: "$invoiceNo" },
             invoiceDate: { $first: "$invoiceDate" },
             amount: { $sum: "$items.netValue" },
+            narrations: { $first: "$narrations" },
           },
         },
       ])
     : [];
 
   const [purchaseReturns, openingBills, payments] = await Promise.all([
-    PurchaseReturn.find({ companyId, supplierId }).select("returnNo returnDate netAmount pendingAmount").lean(),
+    PurchaseReturn.find({ companyId, supplierId }).select("returnNo returnDate netAmount pendingAmount narrations").lean(),
     OpeningBill.find({ companyId, type: "purchase", supplierId }).select("billNo billDate totalAmount pendingAmount").lean(),
-    Payment.find({ companyId, partyType: "Supplier", partyId: supplierId }).select("paymentType paymentDate amount referenceNo narrations").lean(),
+    Payment.find({ companyId, partyType: "Supplier", partyId: supplierId })
+      .select("paymentType paymentDate amount referenceNo narrations allocations notes bankAccountId paymentMode")
+      .populate("bankAccountId", "bankName accountNumber")
+      .lean(),
   ]);
 
-  // ⚠️→✅ Payment rows added for the same reason loadCustomerLedgerEntries'
-  // comment explains — a real, previously-invisible bug: paying a Supplier
-  // via the Payments page never showed up as its own row in their Ledger.
-  // "Pay" (money going out to the supplier) debits the ledger — reduces what
-  // we owe them, same direction a Purchase Return already uses. "Receive"
-  // (a refund coming back from them) credits it, same as a Purchase.
+  const billMap = new Map();
+  purchaseRows.forEach((pr) => billMap.set(String(pr._id), { billNo: pr.invoiceNo, type: "Purchase", id: pr._id }));
+  purchaseReturns.forEach((pr) => billMap.set(String(pr._id), { billNo: pr.returnNo, type: "Purchase Return", id: pr._id }));
+  openingBills.forEach((ob) => billMap.set(String(ob._id), { billNo: ob.billNo, type: "Opening Balance", id: ob._id }));
+
+  const remainingIds = [];
+  for (const p of payments) {
+    for (const a of (p.allocations || [])) {
+      if (a.invoiceId && !billMap.has(String(a.invoiceId))) {
+        remainingIds.push(a.invoiceId);
+      }
+    }
+  }
+  if (remainingIds.length > 0) {
+    const extraPurchases = await Purchase.find({ _id: { $in: remainingIds } }).select("_id invoiceNo").lean();
+    extraPurchases.forEach((pr) => billMap.set(String(pr._id), { billNo: pr.invoiceNo, type: "Purchase", id: pr._id }));
+  }
+
   const entries = [
-    ...openingBills.map((b) => ({ date: b.billDate, type: "Opening Balance", ref: b.billNo, id: b._id, debit: 0, credit: b.totalAmount, pendingAmount: b.pendingAmount })),
-    ...purchaseRows.map((p) => ({ date: p.invoiceDate, type: "Purchase", ref: p.invoiceNo, id: p._id, debit: 0, credit: p.amount, pendingAmount: null })),
-    ...purchaseReturns.map((r) => ({ date: r.returnDate, type: "Purchase Return", ref: r.returnNo, id: r._id, debit: r.netAmount, credit: 0, pendingAmount: r.pendingAmount })),
-    ...payments.map((p) => ({
-      date: p.paymentDate,
-      type: p.paymentType === "Pay" ? "Payment Paid" : "Payment Received",
-      ref: paymentRef(p),
-      id: p._id,
-      debit: p.paymentType === "Pay" ? p.amount : 0,
-      credit: p.paymentType === "Receive" ? p.amount : 0,
-      pendingAmount: null,
+    ...openingBills.map((b) => ({
+      date: b.billDate,
+      type: "Opening Balance",
+      particulars: "Opening Balance",
+      vchType: "",
+      vchNo: b.billNo || "-",
+      opposingDrCr: "Dr",
+      ref: b.billNo,
+      id: b._id,
+      debit: 0,
+      credit: b.totalAmount,
+      pendingAmount: b.pendingAmount,
+      narrations: [],
+      bills: [],
     })),
+    ...purchaseRows.map((p) => {
+      const narText = Array.isArray(p.narrations) && p.narrations.length > 0
+        ? p.narrations.map((n) => (typeof n === "string" ? n : n.code || n.type)).filter(Boolean).join(", ")
+        : "";
+      return {
+        date: p.invoiceDate,
+        type: "Purchase",
+        particulars: narText || "TRANSPORT FREIGHT (18%)",
+        vchType: "Purchase",
+        vchNo: p.invoiceNo,
+        opposingDrCr: "Dr",
+        ref: p.invoiceNo,
+        id: p._id,
+        debit: 0,
+        credit: p.amount,
+        pendingAmount: null,
+        narrations: p.narrations || [],
+        bills: [],
+      };
+    }),
+    ...purchaseReturns.map((r) => ({
+      date: r.returnDate,
+      type: "Purchase Return",
+      particulars: "Purchase Return",
+      vchType: "Debit Note",
+      vchNo: r.returnNo,
+      opposingDrCr: "Cr",
+      ref: r.returnNo,
+      id: r._id,
+      debit: r.netAmount,
+      credit: 0,
+      pendingAmount: r.pendingAmount,
+      narrations: r.narrations || [],
+      bills: [],
+    })),
+    ...payments.map((p) => {
+      let bills = (p.allocations || [])
+        .map((a) => {
+          const match = billMap.get(String(a.invoiceId));
+          if (!match) return null;
+          return {
+            id: String(match.id),
+            billNo: match.billNo,
+            type: match.type,
+            allocatedAmount: a.allocatedAmount,
+          };
+        })
+        .filter(Boolean);
+
+      if (bills.length === 0 && p.notes) {
+        const m = p.notes.match(/Invoice\s+([A-Za-z0-9_-]+)/i);
+        if (m) {
+          const found = [...billMap.values()].find((b) => String(b.billNo) === m[1]);
+          bills = [{ id: found ? String(found.id) : null, billNo: m[1], type: "Purchase", allocatedAmount: p.amount }];
+        }
+      }
+
+      const bankName = p.bankAccountId?.bankName || (p.paymentMode === "Cash" ? "Cash" : "Bank of India");
+      const isPay = p.paymentType === "Pay";
+
+      return {
+        date: p.paymentDate,
+        type: isPay ? "Payment Paid" : "Payment Received",
+        particulars: bankName || (isPay ? "Payment" : "Receipt"),
+        vchType: isPay ? "Payment" : "Receipt",
+        vchNo: paymentRef(p),
+        opposingDrCr: isPay ? "Cr" : "Dr",
+        ref: paymentRef(p),
+        id: p._id,
+        debit: isPay ? p.amount : 0,
+        credit: !isPay ? p.amount : 0,
+        pendingAmount: null,
+        narrations: p.narrations || [],
+        bills,
+      };
+    }),
   ];
 
   return { party: supplier, entries };
@@ -976,7 +1392,16 @@ const getSupplierLedger = async (req, res) => {
     const supplier = loaded.party;
 
     res.status(200).json({
-      party: { id: supplier._id, name: supplier.name, phone: supplier.phone, gstNo: supplier.gstNo, city: supplier.city },
+      party: {
+        id: supplier._id,
+        name: supplier.name,
+        phone: supplier.phone,
+        gstNo: supplier.gstNo,
+        city: supplier.city,
+        address: supplier.address,
+        state: supplier.state,
+        pincode: supplier.pincode,
+      },
       ...ledger,
     });
   } catch (error) {
@@ -1742,7 +2167,31 @@ function ledgerExcelColumns() {
   return [
     { header: "Date", width: 70, accessor: (r) => (r.date ? fmtDate(r.date) : "-") },
     { header: "Type", width: 90, accessor: (r) => r.type },
+    {
+      header: "Bill No",
+      width: 75,
+      accessor: (r) => {
+        if (Array.isArray(r.bills) && r.bills.length > 0) {
+          return r.bills.map((b) => b.billNo).join(", ");
+        }
+        if (r.type === "Purchase" || r.type === "Sale" || r.type === "Opening Balance") {
+          return r.ref && r.ref !== "-" ? r.ref : "-";
+        }
+        return "-";
+      },
+    },
     { header: "Ref No", width: 70, accessor: (r) => r.ref },
+    {
+      header: "Narration",
+      width: 100,
+      accessor: (r) =>
+        Array.isArray(r.narrations) && r.narrations.length > 0
+          ? r.narrations
+              .map((n) => (typeof n === "string" ? n : n.type && n.code ? `${n.type}: ${n.code}` : n.code || n.type || ""))
+              .filter(Boolean)
+              .join(", ")
+          : "-",
+    },
     { header: "Debit", width: 85, accessor: (r) => r.debit || 0, align: "right", moneyCol: true },
     { header: "Credit", width: 85, accessor: (r) => r.credit || 0, align: "right", moneyCol: true },
     { header: "Balance", width: 90, accessor: (r) => r.balance, align: "right" },
@@ -1759,6 +2208,7 @@ function ledgerExcelRows(ledger, dateFrom, openingLabelDebit) {
           debit: openingLabelDebit ? Math.max(ledger.openingBalance, 0) : Math.max(-ledger.openingBalance, 0),
           credit: openingLabelDebit ? Math.max(-ledger.openingBalance, 0) : Math.max(ledger.openingBalance, 0),
           balance: ledger.openingBalance,
+          narrations: [],
         },
       ]
     : [];
@@ -1788,27 +2238,15 @@ const exportCustomerLedger = async (req, res) => {
 
     const format = req.query.format || "excel";
     if (format === "pdf") {
-      // Same card figures as customers/ledger/[id]/page.tsx's own
-      // totalSales/totalReceived — Sale Return rows deliberately excluded,
-      // same rationale as the on-screen cards (see that page's comment).
-      const totalSales = ledger.entries.filter((e) => e.type === "Sale").reduce((s, e) => s + (e.debit || 0), 0);
-      const totalReceived = ledger.entries.filter((e) => e.type === "Payment Received").reduce((s, e) => s + (e.credit || 0), 0);
-      const closing = ledger.closingBalance;
+      const company = await Company.findById(companyId).lean();
       await sendLedgerPdf(res, {
-        title: `${loaded.party.name} — Ledger`,
-        subtitle: partySubtitle(loaded.party),
-        cards: [
-          { label: "Total Sales", value: `Rs.${totalSales.toFixed(2)}` },
-          { label: "Total Received", value: `Rs.${totalReceived.toFixed(2)}`, color: "#15803d" },
-          {
-            label: "Closing Balance",
-            value: closing < 0 ? `Rs.${Math.abs(closing).toFixed(2)} Advance` : `Rs.${closing.toFixed(2)} Receivable`,
-            color: closing < 0 ? "#15803d" : "#dc2626",
-          },
-        ],
-        columns: ledgerExcelColumns(),
-        records: rows,
+        company,
+        party: loaded.party,
+        dateFrom,
+        dateTo,
+        ledger,
         filename: `${safeName}_Ledger.pdf`,
+        isDebtor: true,
       });
     } else {
       await sendExcelFile(res, "Customer Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);
@@ -1841,27 +2279,15 @@ const exportSupplierLedger = async (req, res) => {
 
     const format = req.query.format || "excel";
     if (format === "pdf") {
-      // Same card figures as suppliers/ledger/[id]/page.tsx's own
-      // totalPurchases/totalPaid — Purchase Return rows deliberately
-      // excluded, same rationale as the on-screen cards (see that page).
-      const totalPurchases = ledger.entries.filter((e) => e.type === "Purchase").reduce((s, e) => s + (e.credit || 0), 0);
-      const totalPaid = ledger.entries.filter((e) => e.type === "Payment Paid").reduce((s, e) => s + (e.debit || 0), 0);
-      const closing = ledger.closingBalance;
+      const company = await Company.findById(companyId).lean();
       await sendLedgerPdf(res, {
-        title: `${loaded.party.name} — Ledger`,
-        subtitle: partySubtitle(loaded.party),
-        cards: [
-          { label: "Total Purchases", value: `Rs.${totalPurchases.toFixed(2)}` },
-          { label: "Total Paid", value: `Rs.${totalPaid.toFixed(2)}`, color: "#15803d" },
-          {
-            label: "Closing Balance",
-            value: closing < 0 ? `Rs.${Math.abs(closing).toFixed(2)} Advance` : `Rs.${closing.toFixed(2)} Payable`,
-            color: closing < 0 ? "#15803d" : "#dc2626",
-          },
-        ],
-        columns: ledgerExcelColumns(),
-        records: rows,
+        company,
+        party: loaded.party,
+        dateFrom,
+        dateTo,
+        ledger,
         filename: `${safeName}_Ledger.pdf`,
+        isDebtor: false,
       });
     } else {
       await sendExcelFile(res, "Supplier Ledger", ledgerExcelColumns(), rows, `${safeName}_Ledger.xlsx`);

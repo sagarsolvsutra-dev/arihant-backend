@@ -53,7 +53,14 @@ function computeLine(raw, item) {
   const lessRs = parseFloat(raw.lessRs) || 0;
   const cdPercent = parseFloat(raw.cdPercent) || 0;
   const cdRs = parseFloat(raw.cdRs) || 0;
-  const gstPercent = parseFloat(raw.gstPercent ?? item.gstPercentage) || 0;
+  // Always derived from the server's own Item record, never the client's
+  // submitted value — matches the same 'never trust client' invariant
+  // packing/purchaseQty above already follow. Previously preferred
+  // raw.gstPercent when present, meaning a direct API call (bypassing the
+  // UI, which always sends the item's own readOnly rate) could book a line
+  // at a GST% that doesn't match the item's actual configured rate, with
+  // the server having no way to catch it.
+  const gstPercent = parseFloat(item.gstPercentage) || 0;
 
   // Never trust the client to have blocked negative input — a negative quantity or
   // rate here would silently corrupt Item stock via applyStockDelta. gstPercent was
@@ -463,6 +470,9 @@ const createPurchase = async (req, res) => {
     const lines = await buildLines(items, companyId);
     const totals = computeTotals(lines);
     const paid = parseFloat(paidAmount) || 0;
+    if (paid < 0) {
+      return res.status(400).json({ message: "Paid Amount cannot be negative" });
+    }
 
     purchase = await Purchase.create({
       companyId,
@@ -579,6 +589,9 @@ const updatePurchase = async (req, res) => {
       Object.assign(purchase, totals);
 
       const paid = paidAmount !== undefined ? parseFloat(paidAmount) || 0 : oldPaidAmount;
+      if (paid < 0) {
+        throw new Error("Paid Amount cannot be negative");
+      }
       purchase.paidAmount = paid;
       purchase.pendingAmount = totals.netAmount - paid;
       if (paymentMode !== undefined) purchase.paymentMode = paymentMode;

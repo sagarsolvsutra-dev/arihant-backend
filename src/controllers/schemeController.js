@@ -53,6 +53,12 @@ const createScheme = async (req, res) => {
     if (!companyId) {
       return res.status(400).json({ message: "companyId is required" });
     }
+    if (lessPercentage !== undefined && (parseFloat(lessPercentage) < 0 || parseFloat(lessPercentage) > 100)) {
+      return res.status(400).json({ message: "Less % must be between 0 and 100" });
+    }
+    if (cdPercentage !== undefined && (parseFloat(cdPercentage) < 0 || parseFloat(cdPercentage) > 100)) {
+      return res.status(400).json({ message: "CD % must be between 0 and 100" });
+    }
 
     // Cross-tenant reference leak guard — see queryHelpers.assertRefBelongsToCompany.
     // itemGroupId is deliberately NOT validated here — it's a known dangling ref
@@ -89,8 +95,14 @@ const updateScheme = async (req, res) => {
       await assertRefBelongsToCompany(Customer, customerId, scheme.companyId, "Customer");
       scheme.customerId = customerId || null;
     }
-    if (lessPercentage !== undefined) scheme.lessPercentage = parseFloat(lessPercentage) || 0;
-    if (cdPercentage !== undefined) scheme.cdPercentage = parseFloat(cdPercentage) || 0;
+    if (lessPercentage !== undefined) {
+      if (parseFloat(lessPercentage) < 0 || parseFloat(lessPercentage) > 100) throw new Error("Less % must be between 0 and 100");
+      scheme.lessPercentage = parseFloat(lessPercentage) || 0;
+    }
+    if (cdPercentage !== undefined) {
+      if (parseFloat(cdPercentage) < 0 || parseFloat(cdPercentage) > 100) throw new Error("CD % must be between 0 and 100");
+      scheme.cdPercentage = parseFloat(cdPercentage) || 0;
+    }
 
     await scheme.save();
     res.status(200).json(scheme);

@@ -22,8 +22,12 @@ function validateMrpEntries(entries) {
     const mrp = parseFloat(entry.mrp) || 0;
     if (mrp < 0) return "MRP cannot be negative";
     if (parseFloat(entry.purchaseRate) < 0) return "Purchase Rate cannot be negative";
-    if (parseFloat(entry.discountPercentage) < 0) return "Discount Percentage cannot be negative";
+    const entryDiscount = parseFloat(entry.discountPercentage);
+    if (entryDiscount < 0) return "Discount Percentage cannot be negative";
+    if (entryDiscount > 100) return "Discount Percentage cannot exceed 100";
     if (parseFloat(entry.packing) < 0) return "Packing cannot be negative";
+    if (entry.purchaseQty !== undefined && parseFloat(entry.purchaseQty) < 0) return "Purchase Qty cannot be negative";
+    if (entry.salesQty !== undefined && parseFloat(entry.salesQty) < 0) return "Sales Qty cannot be negative";
     if (seen.has(mrp)) {
       return `Duplicate MRP entry: ${mrp}`;
     }
@@ -125,12 +129,20 @@ const createItem = async (req, res) => {
     if (parseFloat(retailRate) < 0) throw new Error("Retail Rate cannot be negative");
     if (parseFloat(distributorRate) < 0) throw new Error("Distributor Rate cannot be negative");
     if (parseFloat(discountPercentage) < 0) throw new Error("Discount Percentage cannot be negative");
+    if (parseFloat(discountPercentage) > 100) throw new Error("Discount Percentage cannot exceed 100");
     if (parseFloat(gstPercentage) < 0) throw new Error("GST Percentage cannot be negative");
     if (parseFloat(commissionRate) < 0) throw new Error("Commission Rate cannot be negative");
     if (parseFloat(weightPerPiece) < 0) throw new Error("Weight Per Piece cannot be negative");
     if (parseFloat(packing) < 0) throw new Error("Packing cannot be negative");
     if (parseFloat(minStockQty) < 0) throw new Error("Min Stock Qty cannot be negative");
     if (parseFloat(maxStockQty) < 0) throw new Error("Max Stock Qty cannot be negative");
+    // purchaseQty/salesQty are Carton-size conversion factors used as divisors
+    // throughout every GST calculation (purchaseController's pricePerPiece =
+    // rate/item.purchaseQty) — a negative value here silently corrupts every
+    // downstream taxable/GST/stock figure for any Purchase/Sale against this
+    // item, not just this one save.
+    if (req.body.purchaseQty !== undefined && parseFloat(req.body.purchaseQty) < 0) throw new Error("Purchase Qty cannot be negative");
+    if (req.body.salesQty !== undefined && parseFloat(req.body.salesQty) < 0) throw new Error("Sales Qty cannot be negative");
 
     // Item Name + Sub Group together identify a unique product — the same Item Name
     // can legitimately repeat across different Sub Groups (see the matching index on
@@ -380,6 +392,7 @@ const updateItem = async (req, res) => {
     if (mrpActive !== undefined) item.mrpActive = mrpActive;
     if (discountPercentage !== undefined) {
       if (parseFloat(discountPercentage) < 0) throw new Error("Discount Percentage cannot be negative");
+      if (parseFloat(discountPercentage) > 100) throw new Error("Discount Percentage cannot exceed 100");
       item.discountPercentage = parseFloat(discountPercentage) || 0;
     }
     if (marginToCostRetailer !== undefined) item.marginToCostRetailer = parseFloat(marginToCostRetailer) || 0;
@@ -393,9 +406,15 @@ const updateItem = async (req, res) => {
     if (lastCostRate !== undefined) item.lastCostRate = parseFloat(lastCostRate) || 0;
 
     if (purchaseType !== undefined) item.purchaseType = purchaseType;
-    if (purchaseQty !== undefined) item.purchaseQty = parseFloat(purchaseQty) || 1;
+    if (purchaseQty !== undefined) {
+      if (parseFloat(purchaseQty) < 0) throw new Error("Purchase Qty cannot be negative");
+      item.purchaseQty = parseFloat(purchaseQty) || 1;
+    }
     if (salesType !== undefined) item.salesType = salesType;
-    if (salesQty !== undefined) item.salesQty = parseFloat(salesQty) || 1;
+    if (salesQty !== undefined) {
+      if (parseFloat(salesQty) < 0) throw new Error("Sales Qty cannot be negative");
+      item.salesQty = parseFloat(salesQty) || 1;
+    }
     if (distributorRate !== undefined) {
       if (parseFloat(distributorRate) < 0) throw new Error("Distributor Rate cannot be negative");
       item.distributorRate = parseFloat(distributorRate) || 0;
