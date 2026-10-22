@@ -1,4 +1,5 @@
 const SaleReturn = require("../models/SaleReturn");
+const { sendInvoicePdf, attachHsnCodes, resolveInvoiceBank, loadCompanyForInvoice } = require("../utils/invoicePdf");
 const Sale = require("../models/Sale");
 const Item = require("../models/Item");
 const Godown = require("../models/Godown");
@@ -8,6 +9,8 @@ const Payment = require("../models/Payment");
 const Customer = require("../models/Customer");
 const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 
 async function resolveNarrations(clientNarrations, companyId) {
   if (!Array.isArray(clientNarrations) || clientNarrations.length === 0) return [];
@@ -87,17 +90,17 @@ function computeLine(raw, item) {
   const totalPieces = billedPieces + freeQty;
   const pricePerPiece = salesQty > 0 ? afterGstRate / salesQty : 0;
 
-  const amount = pricePerPiece * billedPieces;
-  const lessAmt = (amount * lessPercent) / 100 + lessRs;
-  const cdAmt = (amount * cdPercent) / 100 + cdRs;
+  const amount = round2(pricePerPiece * billedPieces);
+  const lessAmt = round2((amount * lessPercent) / 100 + lessRs);
+  const cdAmt = round2((amount * cdPercent) / 100 + cdRs);
   // Discounts can never exceed the line's own amount — otherwise taxableValue/netValue
   // go negative with no error anywhere, silently corrupting the return total.
   if (lessAmt + cdAmt > amount + 1e-6) {
     throw new Error(`Discounts cannot exceed the line amount (item: ${item.itemName})`);
   }
-  const netValue = amount - lessAmt - cdAmt;
-  const taxableValue = gstPercent > 0 ? netValue / (1 + gstPercent / 100) : netValue;
-  const gstAmount = netValue - taxableValue;
+  const netValue = round2(amount - lessAmt - cdAmt);
+  const taxableValue = round2(gstPercent > 0 ? netValue / (1 + gstPercent / 100) : netValue);
+  const gstAmount = round2(netValue - taxableValue);
 
   const beforeGstRate =
     billedPieces > 0
@@ -132,7 +135,7 @@ function computeLine(raw, item) {
 }
 
 function computeTotals(lines) {
-  return lines.reduce(
+  const totals = lines.reduce(
     (acc, l) => {
       acc.totalItems += 1;
       acc.totalCase += l.caseQty;
@@ -155,6 +158,11 @@ function computeTotals(lines) {
       netAmount: 0,
     }
   );
+  totals.totalTaxableValue = round2(totals.totalTaxableValue);
+  totals.totalGstAmount = round2(totals.totalGstAmount);
+  totals.totalAmount = round2(totals.totalAmount);
+  totals.netAmount = round2(totals.netAmount);
+  return totals;
 }
 
 // Items and Godowns are scoped to `companyId` — without this, a line whose
@@ -517,7 +525,7 @@ const createSaleReturn = async (req, res) => {
       items: lines,
       ...totals,
       refundAmount: refund,
-      pendingAmount: totals.netAmount - refund,
+      pendingAmount: round2(totals.netAmount - refund),
       paymentMode,
       bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
       dueDate: dueDate || null,
@@ -645,7 +653,7 @@ const updateSaleReturn = async (req, res) => {
         throw new Error("Refund Amount cannot be negative");
       }
       saleReturn.refundAmount = refund;
-      saleReturn.pendingAmount = totals.netAmount - refund;
+      saleReturn.pendingAmount = round2(totals.netAmount - refund);
       if (paymentMode !== undefined) saleReturn.paymentMode = paymentMode;
       if (usesBankAccount(paymentMode)) saleReturn.bankAccountId = bankAccountId;
       else if (paymentMode) saleReturn.bankAccountId = null;
@@ -723,7 +731,50 @@ const deleteSaleReturn = async (req, res) => {
   }
 };
 
+// GET /api/... — printable GST tax invoice PDF.
+// Read-only: builds the printed document from the already-saved record, the
+// company letterhead (Settings page) and the bank selected on this very
+// transaction. Nothing here mutates stock, payments or balances.
+const getSaleReturnInvoice = async (req, res) => {
+  try {
+    const companyId = req.effectiveCompanyId;
+    const tx = await SaleReturn.findOne({ _id: req.params.id, companyId }).lean();
+    if (!tx) return res.status(404).json({ message: "Record not found" });
+
+    const company = await loadCompanyForInvoice(companyId);
+    if (!company) return res.status(404).json({ message: "Company not found" });
+
+    const party = tx.customerId
+      ? await Customer.findOne({ _id: tx.customerId, companyId }).lean()
+      : null;
+
+    const [items, bank] = await Promise.all([
+      attachHsnCodes(tx.items, companyId),
+      resolveInvoiceBank(tx, company),
+    ]);
+
+    const no = tx.invoiceNo || tx.returnNo || "doc";
+    const safe = String(no).replace(/[^A-Za-z0-9_-]/g, "_");
+    await sendInvoicePdf(res, {
+      doc: { ...tx, items },
+      company,
+      party,
+      bank,
+      // Entered rate is GST-INCLUSIVE on this module (CLAUDE.md quirk #24),
+      // so the invoice must convert to an ex-GST basis before reporting a
+      // discount — otherwise GST is counted as discount.
+      gstInclusive: true,
+      titles: { main: "TAX INVOICE", copy: "Original", sub: "CREDIT MEMO", noLabel: "Return No.", dateLabel: "Return Date", partyGstLabel: "Cust. GSTIN" },
+      filename: `Credit_Memo_${safe}.pdf`,
+    });
+  } catch (error) {
+    if (!res.headersSent) res.status(500).json({ message: error.message || "Server Error" });
+    else res.end();
+  }
+};
+
 module.exports = {
+  getSaleReturnInvoice,
   getSaleReturns,
   getSaleReturnById,
   lookupOriginalInvoice,

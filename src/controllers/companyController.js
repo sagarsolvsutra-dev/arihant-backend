@@ -402,4 +402,64 @@ const deleteCompany = async (req, res) => {
   }
 };
 
-module.exports = { getCompanyById, getCompanies, createCompany, updateCompany, deleteCompany };
+
+// @desc    Update the CALLER'S OWN company letterhead details (Settings page)
+// @route   PUT /api/companies/my-company
+// Deliberately separate from updateCompany (super_admin-only): a company_admin
+// must be able to maintain their own address/GSTIN because those values are
+// printed as the letterhead on every Tally-style ledger PDF in the app, and
+// previously only a super_admin could set them. The field allowlist below is
+// the whole security boundary — `name`, `code`, `isActive` and anything
+// admin-user-related are intentionally NOT editable here, so this can never
+// become a backdoor for renaming/activating a company or touching its admin.
+const updateMyCompany = async (req, res) => {
+  try {
+    const companyId = req.user.companyId;
+    if (!companyId) {
+      return res.status(400).json({ message: "Your account is not linked to a company" });
+    }
+    const company = await Company.findById(companyId);
+    if (!company) return res.status(404).json({ message: "Company not found" });
+
+    // Letterhead fields only. Each is assigned when PRESENT in the body (not
+    // when truthy) so a field can genuinely be cleared back to blank — the
+    // same `!== undefined` convention every other updateX handler uses.
+    const allowed = [
+      "address", "phone", "email", "gstNo", "panNo",
+      // Tax-invoice letterhead/footer fields — same self-service scope.
+      "state", "mobile2", "jurisdiction", "chequeReturnCharges", "defaultBankAccountId",
+    ];
+    for (const f of allowed) {
+      if (req.body[f] === undefined) continue;
+      if (f === "defaultBankAccountId") {
+        const v = req.body[f];
+        if (!v) { company[f] = null; continue; }
+        // Cross-tenant guard: a bank account from another company must never
+        // end up printed on this company's invoices.
+        const BankAccount = require("../models/BankAccount");
+        const bank = await BankAccount.findOne({ _id: v, companyId: company._id }).select("_id").lean();
+        if (!bank) return res.status(400).json({ message: "Invalid Bank Account — not found in this company" });
+        company[f] = v;
+        continue;
+      }
+      if (f === "chequeReturnCharges") {
+        const n = Number(req.body[f]);
+        if (isNaN(n) || n < 0) return res.status(400).json({ message: "Cheque Return Charges cannot be negative" });
+        company[f] = n;
+        continue;
+      }
+      company[f] = req.body[f];
+    }
+
+    await company.save();
+    res.status(200).json({
+      success: true,
+      message: "Company details updated successfully",
+      company,
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
+module.exports = { getCompanyById, updateMyCompany, getCompanies, createCompany, updateCompany, deleteCompany };

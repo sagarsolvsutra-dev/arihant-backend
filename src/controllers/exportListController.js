@@ -1,4 +1,5 @@
 const ExcelJS = require("exceljs");
+const { XLSX, PDF, styleHeaderRow, styleTotalRow, styleDataRow } = require("../utils/exportTheme");
 const PDFDocument = require("pdfkit");
 const Supplier = require("../models/Supplier");
 const SupplierGroup = require("../models/SupplierGroup");
@@ -28,6 +29,19 @@ function fmtDate(d) {
 function money(n) {
   return Number(n || 0);
 }
+
+// Every quantity exported from this app prints as a piece total AND its
+// Carton(Case) + loose-Pcs split, keyed off that item's own packing — a
+// wholesale distributor counts stock in cartons, and a bare piece count is
+// unusable on the warehouse floor. Truncates toward zero so a negative figure
+// reads "0 Case -3 Pcs", matching splitCasePcsTrunc in reportController.js.
+function splitCase(totalPcs, packing) {
+  const p = packing || 1;
+  const caseQty = Math.trunc((totalPcs || 0) / p);
+  return { caseQty, pcs: (totalPcs || 0) - caseQty * p };
+}
+const cs = (pcs, packing) => splitCase(pcs, packing).caseQty;
+const ls = (pcs, packing) => splitCase(pcs, packing).pcs;
 
 const LIST_EXPORT_CONFIG = {
   suppliers: {
@@ -69,6 +83,17 @@ const LIST_EXPORT_CONFIG = {
       { header: "Pur. Type", width: 65, accessor: (r) => r.purchaseType || "-" },
       { header: "MRP", width: 65, accessor: (r) => money(r.mrp), align: "right", moneyCol: true },
       { header: "Net Cost - Self", width: 80, accessor: (r) => money(r.lastCostRate), align: "right", moneyCol: true },
+      // Stock was missing from this export entirely — an item list with no
+      // stock figure is the one thing a distributor actually opens it for.
+      { header: "Fresh Stock (Pcs)", width: 80, accessor: (r) => r.openingStockFreshPcs || 0, align: "right" },
+      { header: "Fresh Case", width: 65, accessor: (r) => cs(r.openingStockFreshPcs, r.packing), align: "right" },
+      { header: "Fresh Loose Pcs", width: 80, accessor: (r) => ls(r.openingStockFreshPcs, r.packing), align: "right" },
+      { header: "Expired Stock (Pcs)", width: 85, accessor: (r) => r.openingStockExpiredPcs || 0, align: "right" },
+      { header: "Expired Case", width: 70, accessor: (r) => cs(r.openingStockExpiredPcs, r.packing), align: "right" },
+      { header: "Expired Loose Pcs", width: 85, accessor: (r) => ls(r.openingStockExpiredPcs, r.packing), align: "right" },
+      { header: "Damaged Stock (Pcs)", width: 90, accessor: (r) => r.openingStockDamagedPcs || 0, align: "right" },
+      { header: "Damaged Case", width: 75, accessor: (r) => cs(r.openingStockDamagedPcs, r.packing), align: "right" },
+      { header: "Damaged Loose Pcs", width: 90, accessor: (r) => ls(r.openingStockDamagedPcs, r.packing), align: "right" },
       { header: "Status", width: 60, accessor: (r) => (r.isActive ? "Active" : "Inactive") },
     ],
   },
@@ -227,6 +252,7 @@ const LIST_EXPORT_CONFIG = {
       { header: "Items", width: 50, accessor: (r) => r.totalItems || 0, align: "right" },
       { header: "Case", width: 50, accessor: (r) => r.totalCase || 0, align: "right" },
       { header: "Loose", width: 50, accessor: (r) => r.totalPcs || 0, align: "right" },
+      { header: "Total Qty", width: 60, accessor: (r) => r.totalQty || 0, align: "right" },
       { header: "Net Amount", width: 85, accessor: (r) => money(r.netAmount), align: "right", moneyCol: true },
       { header: "Pending", width: 80, accessor: (r) => money(r.pendingAmount), align: "right", moneyCol: true },
     ],
@@ -245,6 +271,7 @@ const LIST_EXPORT_CONFIG = {
       { header: "Items", width: 50, accessor: (r) => r.totalItems || 0, align: "right" },
       { header: "Case", width: 50, accessor: (r) => r.totalCase || 0, align: "right" },
       { header: "Loose", width: 50, accessor: (r) => r.totalPcs || 0, align: "right" },
+      { header: "Total Qty", width: 60, accessor: (r) => r.totalQty || 0, align: "right" },
       { header: "Net Amount", width: 85, accessor: (r) => money(r.netAmount), align: "right", moneyCol: true },
       { header: "Pending", width: 80, accessor: (r) => money(r.pendingAmount), align: "right", moneyCol: true },
     ],
@@ -282,11 +309,8 @@ function addExcelSheet(workbook, sheetName, columns, records) {
     });
     sheet.addRow(row);
   });
-  const headerRow = sheet.getRow(1);
-  headerRow.eachCell((cell) => {
-    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF111111" } };
-  });
+  styleHeaderRow(sheet.getRow(1));
+  records.forEach((_, i) => styleDataRow(sheet.getRow(i + 2), i));
   columns.forEach((c, i) => {
     if (c.align === "right") sheet.getColumn(i + 1).alignment = { horizontal: "right" };
   });
@@ -298,7 +322,7 @@ function addExcelSheet(workbook, sheetName, columns, records) {
     });
     totals[`c0`] = totals[`c0`] || "TOTAL";
     const totalRow = sheet.addRow(totals);
-    totalRow.font = { bold: true };
+    styleTotalRow(totalRow);
   }
 }
 
@@ -308,8 +332,8 @@ async function sendPdfFile(res, title, columns, records, filename) {
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   doc.pipe(res);
 
-  doc.fontSize(16).fillColor("#000").text(title);
-  doc.fontSize(9).fillColor("#666").text(`Generated ${new Date().toLocaleString("en-IN")}`);
+  doc.fontSize(16).fillColor(PDF.accent).text(title);
+  doc.fontSize(9).fillColor(PDF.mutedText).text(`Generated ${new Date().toLocaleString("en-IN")}`);
   let y = doc.y + 16;
   
   const startX = doc.page.margins.left;
@@ -321,8 +345,8 @@ async function sendPdfFile(res, title, columns, records, filename) {
 
   function drawHeaderRow() {
     let x = startX;
-    doc.rect(startX, y, totalWidth, rowHeight).fill("#111111");
-    doc.fillColor("#fff").fontSize(9);
+    doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.headerBg);
+    doc.fillColor(PDF.headerText).fontSize(9);
     columns.forEach((c) => {
       const w = c.width * scale;
       doc.text(c.header, x + 4, y + 6, { width: w - 8, align: c.align || "left" });
@@ -334,7 +358,7 @@ async function sendPdfFile(res, title, columns, records, filename) {
   drawHeaderRow();
 
   if (records.length === 0) {
-    doc.fillColor("#888").fontSize(8.5).text("No records.", startX + 4, y + 4);
+    doc.fillColor(PDF.mutedText).fontSize(8.5).text("No records.", startX + 4, y + 4);
     y += rowHeight;
   }
 
@@ -345,10 +369,10 @@ async function sendPdfFile(res, title, columns, records, filename) {
       drawHeaderRow();
     }
     if (idx % 2 === 1) {
-      doc.rect(startX, y, totalWidth, rowHeight).fill("#f5f5f5");
+      doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.zebraBg);
     }
     let x = startX;
-    doc.fillColor("#000").fontSize(8.5);
+    doc.fillColor(PDF.bodyText).fontSize(8.5);
     columns.forEach((c) => {
       const w = c.width * scale;
       let val = c.accessor(r);
@@ -365,8 +389,8 @@ async function sendPdfFile(res, title, columns, records, filename) {
       doc.addPage();
       y = doc.page.margins.top;
     }
-    doc.rect(startX, y, totalWidth, rowHeight).fill("#e5e5e5");
-    doc.fillColor("#000").fontSize(9).font("Helvetica-Bold");
+    doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.totalBg);
+    doc.fillColor(PDF.totalText).fontSize(9).font("Helvetica-Bold");
     let x = startX;
     columns.forEach((c, i) => {
       const w = c.width * scale;

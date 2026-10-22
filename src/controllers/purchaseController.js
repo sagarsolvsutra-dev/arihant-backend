@@ -1,4 +1,5 @@
 const Purchase = require("../models/Purchase");
+const { sendInvoicePdf, attachHsnCodes, resolveInvoiceBank, loadCompanyForInvoice } = require("../utils/invoicePdf");
 const Item = require("../models/Item");
 const Godown = require("../models/Godown");
 const Payment = require("../models/Payment");
@@ -6,6 +7,8 @@ const BankAccount = require("../models/BankAccount");
 const Narration = require("../models/Narration");
 const { searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 
 async function resolveNarrations(clientNarrations, companyId) {
   if (!Array.isArray(clientNarrations) || clientNarrations.length === 0) return [];
@@ -94,17 +97,17 @@ function computeLine(raw, item) {
   const totalPieces = billedPieces + freeQty;
   const pricePerPiece = purchaseQty > 0 ? beforeGstRate / purchaseQty : 0;
 
-  const amount = pricePerPiece * billedPieces;
-  const lessAmt = (amount * lessPercent) / 100 + lessRs;
-  const cdAmt = (amount * cdPercent) / 100 + cdRs;
+  const amount = round2(pricePerPiece * billedPieces);
+  const lessAmt = round2((amount * lessPercent) / 100 + lessRs);
+  const cdAmt = round2((amount * cdPercent) / 100 + cdRs);
   // Discounts can never exceed the line's own amount — otherwise taxableValue/netValue
   // go negative with no error anywhere, silently corrupting the invoice total.
   if (lessAmt + cdAmt > amount + 1e-6) {
     throw new Error(`Discounts cannot exceed the line amount (item: ${item.itemName})`);
   }
-  const taxableValue = amount - lessAmt - cdAmt;
-  const gstAmount = (taxableValue * gstPercent) / 100;
-  const netValue = taxableValue + gstAmount;
+  const taxableValue = round2(amount - lessAmt - cdAmt);
+  const gstAmount = round2((taxableValue * gstPercent) / 100);
+  const netValue = round2(taxableValue + gstAmount);
 
   // Express the discounted/after-GST rate on the same basis as beforeGstRate (per
   // purchaseQty units) by scaling taxableValue back up from its billedPieces basis —
@@ -142,7 +145,7 @@ function computeLine(raw, item) {
 }
 
 function computeTotals(lines) {
-  return lines.reduce(
+  const totals = lines.reduce(
     (acc, l) => {
       acc.totalItems += 1;
       acc.totalCase += l.caseQty;
@@ -165,6 +168,11 @@ function computeTotals(lines) {
       netAmount: 0,
     }
   );
+  totals.totalTaxableValue = round2(totals.totalTaxableValue);
+  totals.totalGstAmount = round2(totals.totalGstAmount);
+  totals.totalAmount = round2(totals.totalAmount);
+  totals.netAmount = round2(totals.netAmount);
+  return totals;
 }
 
 // Builds validated + recomputed lines from raw client input, keyed against the real
@@ -484,7 +492,7 @@ const createPurchase = async (req, res) => {
       items: lines,
       ...totals,
       paidAmount: paid,
-      pendingAmount: totals.netAmount - paid,
+      pendingAmount: round2(totals.netAmount - paid),
       paymentMode,
       bankAccountId: usesBankAccount(paymentMode) ? bankAccountId : null,
       dueDate: dueDate || null,
@@ -593,7 +601,7 @@ const updatePurchase = async (req, res) => {
         throw new Error("Paid Amount cannot be negative");
       }
       purchase.paidAmount = paid;
-      purchase.pendingAmount = totals.netAmount - paid;
+      purchase.pendingAmount = round2(totals.netAmount - paid);
       if (paymentMode !== undefined) purchase.paymentMode = paymentMode;
       if (usesBankAccount(paymentMode)) purchase.bankAccountId = bankAccountId;
       else if (paymentMode) purchase.bankAccountId = null;
@@ -680,7 +688,51 @@ const deletePurchase = async (req, res) => {
   }
 };
 
+// GET /api/... — printable GST tax invoice PDF.
+// Read-only: builds the printed document from the already-saved record, the
+// company letterhead (Settings page) and the bank selected on this very
+// transaction. Nothing here mutates stock, payments or balances.
+const getPurchaseInvoice = async (req, res) => {
+  try {
+    const companyId = req.effectiveCompanyId;
+    const tx = await Purchase.findOne({ _id: req.params.id, companyId }).lean();
+    if (!tx) return res.status(404).json({ message: "Record not found" });
+
+    const company = await loadCompanyForInvoice(companyId);
+    if (!company) return res.status(404).json({ message: "Company not found" });
+
+    // Purchase stores no supplierId (quirk #9) — resolve it the same
+    // best-effort way the auto-Payment and the Return "Fetch" button already
+    // do: through the first line item's own Item.supplierId.
+    const Supplier = require("../models/Supplier");
+    const supplierId = await resolveSupplierIdForLines(tx.items);
+    const party = supplierId
+      ? await Supplier.findOne({ _id: supplierId, companyId }).lean()
+      : null;
+
+    const [items, bank] = await Promise.all([
+      attachHsnCodes(tx.items, companyId),
+      resolveInvoiceBank(tx, company),
+    ]);
+
+    const no = tx.invoiceNo || tx.returnNo || "doc";
+    const safe = String(no).replace(/[^A-Za-z0-9_-]/g, "_");
+    await sendInvoicePdf(res, {
+      doc: { ...tx, items },
+      company,
+      party,
+      bank,
+      titles: { main: "PURCHASE INVOICE", copy: "Original", sub: "", noLabel: "Invoice No.", dateLabel: "Invoice Date", partyGstLabel: "Supp. GSTIN" },
+      filename: `Purchase_${safe}.pdf`,
+    });
+  } catch (error) {
+    if (!res.headersSent) res.status(500).json({ message: error.message || "Server Error" });
+    else res.end();
+  }
+};
+
 module.exports = {
+  getPurchaseInvoice,
   getPurchases,
   getPurchaseById,
   createPurchase,

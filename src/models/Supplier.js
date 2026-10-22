@@ -54,6 +54,29 @@ const SupplierSchema = new mongoose.Schema(
       type: String,
       default: "",
     },
+
+    // --- Ship To (delivery) address -------------------------------------
+    // Optional. When left blank the party has ONE address and the printed
+    // invoice shows a single "Ship To" block; when filled AND different from
+    // the billing address above, the invoice prints "Bill To" and "Ship To"
+    // separately. See sameAddress() in utils/invoicePdf.js — the comparison
+    // is normalised (case/whitespace/punctuation), not a raw string equality.
+    shippingAddress: {
+      type: String,
+      default: "",
+    },
+    shippingCity: {
+      type: String,
+      default: "",
+    },
+    shippingState: {
+      type: String,
+      default: "",
+    },
+    shippingPincode: {
+      type: String,
+      default: "",
+    },
     gstNo: {
       type: String,
       default: "",

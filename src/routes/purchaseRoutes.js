@@ -8,7 +8,11 @@ const {
   createPurchase,
   updatePurchase,
   deletePurchase,
+  getPurchaseInvoice,
 } = require("../controllers/purchaseController");
+
+// Printable GST tax-invoice PDF for a single record.
+router.get("/:id/invoice", getPurchaseInvoice);
 
 router.route("/").get(getPurchases).post(createPurchase);
 router.route("/:id").get(getPurchaseById).put(updatePurchase).delete(deletePurchase);

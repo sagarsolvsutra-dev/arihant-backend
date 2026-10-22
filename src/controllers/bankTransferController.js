@@ -4,6 +4,8 @@ const Payment = require("../models/Payment");
 const Narration = require("../models/Narration");
 const { clampLimit, clampPage } = require("../utils/queryHelpers");
 
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
+
 // Resolves client-submitted Narration ids against the company's own Narration
 // master and snapshots {narrationId, type, code} — see Expense.js's
 // NarrationRefSchema comment for why this is a copy, not a live reference.
@@ -116,11 +118,11 @@ const createBankTransfer = async (req, res) => {
     }
 
     // Deduct from source
-    fromBank.currentBalance -= transferAmount;
+    fromBank.currentBalance = round2((fromBank.currentBalance || 0) - transferAmount);
     await fromBank.save();
 
     // Add to destination
-    toBank.currentBalance = (toBank.currentBalance || 0) + transferAmount;
+    toBank.currentBalance = round2((toBank.currentBalance || 0) + transferAmount);
     await toBank.save();
 
     const narrations = await resolveNarrations(narrationIds, companyId);

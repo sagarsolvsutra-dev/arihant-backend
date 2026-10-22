@@ -1,6 +1,7 @@
 const Account = require("../models/Account");
 const AccountGroup = require("../models/AccountGroup");
 const { assertRefBelongsToCompany, searchRegex, clampLimit, clampPage } = require("../utils/queryHelpers");
+const { sendLedgerPdf } = require("../utils/tallyPdf");
 
 // Dr/Cr is stored as a magnitude + a separate type field (matching the
 // reference screenshot's Op.Balance/Cl.Balance + Dr-Cr pair exactly), but the
@@ -190,6 +191,58 @@ const deleteAccount = async (req, res) => {
   }
 };
 
+// Shared by getAccountStatement (JSON, for the on-screen statement page) and
+// exportAccountStatement (the Tally-style PDF) so the two can never disagree
+// about what's in the statement or what the opening balance is — the same
+// single-builder convention reportController already uses for the
+// Customer/Supplier Ledger. Returns null when the Account doesn't exist in
+// this company.
+async function buildAccountStatement(companyId, id, dateFrom, dateTo) {
+    const account = await Account.findOne({ _id: id, companyId }).populate("accountGroupId", "name");
+    if (!account) return null;
+
+    const Expense = require("../models/Expense");
+
+    // A genuine "balance as of dateFrom" — mirrors reportController.buildLedger's
+    // own before-range accumulation for the Customer/Supplier Ledger, and the
+    // identical fix just applied to bankAccountController.getBankAccountStatement.
+    // Without this, applying a dateFrom filter silently ignored every Expense
+    // dated before it, leaving the table's running balance out of sync with
+    // the always-live "Current Balance" KPI shown next to it.
+  let openingBalanceAsOf = account.openingBalance || 0;
+  let openingBalanceTypeAsOf = account.openingBalanceType || "Dr";
+  if (dateFrom) {
+    // Reuses this file's own module-level toSigned (Dr positive, Cr negative)
+    // rather than redeclaring a local copy of it.
+    let signed = toSigned(openingBalanceAsOf, openingBalanceTypeAsOf);
+    const priorExpenses = await Expense.find({
+      accountId: id,
+      companyId,
+      expenseDate: { $lt: new Date(dateFrom) },
+    }).select("amount");
+    // Expenses always post Dr to the account (see applyAccountEffect) —
+    // mirrors that same convention here rather than re-deriving it.
+    for (const e of priorExpenses) signed += e.amount;
+    openingBalanceAsOf = Math.abs(signed);
+    openingBalanceTypeAsOf = signed < 0 ? "Cr" : "Dr";
+  }
+
+  // Find all Expenses linked to this account
+  let filter = { accountId: id, companyId };
+  if (dateFrom || dateTo) {
+    filter.expenseDate = {};
+    if (dateFrom) filter.expenseDate.$gte = new Date(dateFrom);
+    if (dateTo) filter.expenseDate.$lte = new Date(dateTo);
+  }
+
+  const expenses = await Expense.find(filter)
+    .populate("bankAccountId", "bankName accountNumber")
+    .sort({ expenseDate: 1, createdAt: 1 })
+    .lean();
+
+  return { account, expenses, openingBalanceAsOf, openingBalanceTypeAsOf };
+}
+
 const getAccountStatement = async (req, res) => {
   try {
     // req.user.companyId is always null for super_admin — every sibling
@@ -201,52 +254,100 @@ const getAccountStatement = async (req, res) => {
     const { id } = req.params;
     const { dateFrom, dateTo } = req.query;
 
-    const account = await Account.findOne({ _id: id, companyId }).populate("accountGroupId", "name");
-    if (!account) {
+    const built = await buildAccountStatement(companyId, id, dateFrom, dateTo);
+    if (!built) {
       return res.status(404).json({ message: "Account not found" });
     }
 
-    const Expense = require("../models/Expense");
-
-    // A genuine "balance as of dateFrom" — mirrors reportController.buildLedger's
-    // own before-range accumulation for the Customer/Supplier Ledger, and the
-    // identical fix just applied to bankAccountController.getBankAccountStatement.
-    // Without this, applying a dateFrom filter silently ignored every Expense
-    // dated before it, leaving the table's running balance out of sync with
-    // the always-live "Current Balance" KPI shown next to it.
-    let openingBalanceAsOf = account.openingBalance || 0;
-    let openingBalanceTypeAsOf = account.openingBalanceType || "Dr";
-    if (dateFrom) {
-      const toSigned = (amount, type) => (type === "Cr" ? -amount : amount);
-      let signed = toSigned(openingBalanceAsOf, openingBalanceTypeAsOf);
-      const priorExpenses = await Expense.find({
-        accountId: id,
-        companyId,
-        expenseDate: { $lt: new Date(dateFrom) },
-      }).select("amount");
-      // Expenses always post Dr to the account (see applyAccountEffect) —
-      // mirrors that same convention here rather than re-deriving it.
-      for (const e of priorExpenses) signed += e.amount;
-      openingBalanceAsOf = Math.abs(signed);
-      openingBalanceTypeAsOf = signed < 0 ? "Cr" : "Dr";
-    }
-
-    // Find all Expenses linked to this account
-    let filter = { accountId: id, companyId };
-    if (dateFrom || dateTo) {
-      filter.expenseDate = {};
-      if (dateFrom) filter.expenseDate.$gte = new Date(dateFrom);
-      if (dateTo) filter.expenseDate.$lte = new Date(dateTo);
-    }
-
-    const expenses = await Expense.find(filter)
-      .populate("bankAccountId", "bankName accountNumber")
-      .sort({ expenseDate: 1, createdAt: 1 })
-      .lean();
-
-    res.status(200).json({ account, expenses, openingBalanceAsOf, openingBalanceTypeAsOf });
+    res.status(200).json(built);
   } catch (error) {
     res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
+// GET /api/accounts/:id/statement/export?dateFrom=&dateTo=
+// Tally-style "Ledger Account" PDF for one chart-of-accounts Account — same
+// shared renderer (utils/tallyPdf.js) the Customer/Supplier Ledgers use.
+const exportAccountStatement = async (req, res) => {
+  try {
+    const companyId = req.effectiveCompanyId;
+    const { id } = req.params;
+    const { dateFrom, dateTo } = req.query;
+
+    const built = await buildAccountStatement(companyId, id, dateFrom, dateTo);
+    if (!built) {
+      return res.status(404).json({ message: "Account not found" });
+    }
+    const { account, expenses, openingBalanceAsOf, openingBalanceTypeAsOf } = built;
+
+    // sendLedgerPdf wants ONE signed opening balance; the Account model stores
+    // a non-negative magnitude plus a separate Dr/Cr type.
+    //
+    // ⚠ The sign here is the OPPOSITE of this file's own toSigned() (Dr
+    // positive, Cr negative) — deliberately, and verified against real data
+    // rather than assumed. toSigned's convention is internal to
+    // applyAccountEffect's arithmetic; sendLedgerPdf's `openingBalance` sign
+    // means something different, and what it means depends on `isDebtor`.
+    // Under `isDebtor: false` the renderer puts a POSITIVE opening on the
+    // CREDIT side and a NEGATIVE one on the DEBIT side, so a Dr opening has
+    // to be passed as negative to land in the Debit column — which is where
+    // the on-screen statement (accounts/[id]/page.tsx) already puts it.
+    //
+    // Passing toSigned()'s value straight through instead put the Dr opening
+    // on the Credit side and SUBTRACTED it: an account with a 1,000 Dr
+    // opening and one 10,000 Dr expense printed a 9,000 Dr closing balance
+    // when its real, live currentBalance is 11,000 Dr. Caught by comparing
+    // the generated PDF against the account's own stored balance.
+    const openingSigned = -toSigned(openingBalanceAsOf, openingBalanceTypeAsOf);
+
+    // Every Expense posts Dr to the Account (see applyAccountEffect) — so each
+    // row is a debit, never a credit.
+    const entries = expenses.map((e) => {
+      const vchNo =
+        e.referenceNo ||
+        (Array.isArray(e.narrations) && e.narrations.length > 0
+          ? e.narrations.map((n) => n.code).filter(Boolean).join(", ")
+          : "") ||
+        "-";
+      return {
+        date: e.expenseDate,
+        particulars: e.category ? `${e.title} (${e.category})` : e.title,
+        type: "Expense",
+        vchType: "Expense",
+        vchNo,
+        ref: vchNo,
+        opposingDrCr: "Dr",
+        debit: e.amount,
+        credit: 0,
+      };
+    });
+
+    const Company = require("../models/Company");
+    const company = await Company.findById(companyId).lean();
+    const safeName = String(account.name || "Account").replace(/[^A-Za-z0-9_-]+/g, "_");
+
+    await sendLedgerPdf(res, {
+      company,
+      party: {
+        name: account.name,
+        address: "",
+        city: account.cityVillage || "",
+        state: "",
+        pincode: "",
+        // panNo is a PAN, NOT a GSTIN — printing it under a "GSTIN:" label
+        // would be plainly wrong, so this stays blank.
+        gstNo: "",
+      },
+      dateFrom,
+      dateTo,
+      ledger: { openingBalance: openingSigned, entries },
+      filename: `${safeName}_Statement.pdf`,
+      isDebtor: false,
+    });
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({ message: error.message || "Server Error" });
+    }
   }
 };
 
@@ -257,6 +358,7 @@ module.exports = {
   updateAccount,
   deleteAccount,
   getAccountStatement,
+  exportAccountStatement,
   applyAccountEffect,
   reverseAccountEffect,
 };

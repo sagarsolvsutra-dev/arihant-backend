@@ -4,6 +4,8 @@ const ItemName = require("../models/ItemName");
 const ItemSubGroup = require("../models/ItemSubGroup");
 const PurchaseReturn = require("../models/PurchaseReturn");
 const SupplierGroup = require("../models/SupplierGroup");
+const OpeningBill = require("../models/OpeningBill");
+const Payment = require("../models/Payment");
 const { sendError } = require("../utils/errorHandler");
 const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
@@ -67,6 +69,7 @@ const createSupplier = async (req, res) => {
   try {
     const {
       companyId, name, alias, phone, phone2, mobile, contactPerson, email, address, city, state, pincode,
+      shippingAddress, shippingCity, shippingState, shippingPincode,
       gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, supplierGroupId, balanceMethod, creditDays, isActive,
     } = req.body;
 
@@ -98,6 +101,12 @@ const createSupplier = async (req, res) => {
       city: city?.trim() || "",
       state: state?.trim() || "",
       pincode: pincode?.trim() || "",
+      // Ship To (delivery) address — optional; blank means "same as billing"
+      // and the invoice then prints a single address block.
+      shippingAddress: shippingAddress?.trim() || "",
+      shippingCity: shippingCity?.trim() || "",
+      shippingState: shippingState?.trim() || "",
+      shippingPincode: shippingPincode?.trim() || "",
       gstNo: gstNo?.trim() || "",
       panNo: panNo?.trim() || "",
       fssaiLicenseNumber: fssaiLicenseNumber?.trim() || "",
@@ -124,6 +133,7 @@ const updateSupplier = async (req, res) => {
 
     const {
       name, alias, phone, phone2, mobile, contactPerson, email, address, city, state, pincode,
+      shippingAddress, shippingCity, shippingState, shippingPincode,
       gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, supplierGroupId, balanceMethod, creditDays, isActive,
     } = req.body;
 
@@ -145,6 +155,10 @@ const updateSupplier = async (req, res) => {
     if (city !== undefined) supplier.city = city.trim() || "";
     if (state !== undefined) supplier.state = state.trim() || "";
     if (pincode !== undefined) supplier.pincode = pincode.trim() || "";
+    if (shippingAddress !== undefined) supplier.shippingAddress = shippingAddress.trim() || "";
+    if (shippingCity !== undefined) supplier.shippingCity = shippingCity.trim() || "";
+    if (shippingState !== undefined) supplier.shippingState = shippingState.trim() || "";
+    if (shippingPincode !== undefined) supplier.shippingPincode = shippingPincode.trim() || "";
     if (gstNo !== undefined) supplier.gstNo = gstNo.trim() || "";
     if (panNo !== undefined) supplier.panNo = panNo.trim() || "";
     if (fssaiLicenseNumber !== undefined) supplier.fssaiLicenseNumber = fssaiLicenseNumber.trim() || "";
@@ -175,19 +189,21 @@ const deleteSupplier = async (req, res) => {
       return res.status(404).json({ message: "Supplier not found" });
     }
 
-    // Item.supplierId, ItemName.supplierId (required), and ItemSubGroup.supplierId all
-    // reference Supplier; PurchaseReturn.supplierId is a real, required field. Hard-
-    // deleting a still-referenced Supplier leaves each of those with a dangling ref
-    // that silently resolves to null via .populate().
-    const [hasItem, hasItemName, hasItemSubGroup, hasPurchaseReturn] = await Promise.all([
+    // Item.supplierId, ItemName.supplierId (required), ItemSubGroup.supplierId,
+    // PurchaseReturn.supplierId, OpeningBill.supplierId (type=purchase), and
+    // Payment.partyId (Supplier) all reference Supplier. Hard-deleting a still-
+    // referenced Supplier leaves dangling references.
+    const [hasItem, hasItemName, hasItemSubGroup, hasPurchaseReturn, hasOpeningBill, hasPayment] = await Promise.all([
       Item.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
       ItemName.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
       ItemSubGroup.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
       PurchaseReturn.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
+      OpeningBill.exists({ companyId: supplier.companyId, supplierId: supplier._id }),
+      Payment.exists({ companyId: supplier.companyId, partyType: "Supplier", partyId: supplier._id }),
     ]);
-    if (hasItem || hasItemName || hasItemSubGroup || hasPurchaseReturn) {
+    if (hasItem || hasItemName || hasItemSubGroup || hasPurchaseReturn || hasOpeningBill || hasPayment) {
       return res.status(400).json({
-        message: "Cannot delete this supplier — it is still referenced by Items, Item Names, Item Sub Groups, or Purchase Returns. Deactivate it instead.",
+        message: "Cannot delete this supplier — it is still referenced by Items, Item Names, Item Sub Groups, Purchase Returns, Opening Bills, or Payments. Deactivate it instead.",
       });
     }
 

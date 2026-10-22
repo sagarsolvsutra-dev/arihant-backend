@@ -5,6 +5,8 @@ const Salesman = require("../models/Salesman");
 const { sendError } = require("../utils/errorHandler");
 const { assertRefBelongsToCompany } = require("../utils/queryHelpers");
 
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
+
 const getOpeningBills = async (req, res) => {
   try {
     const { companyId, type } = req.query;
@@ -43,7 +45,7 @@ const createOpeningBill = async (req, res) => {
     if (parseFloat(totalAmount) < 0) {
       throw new Error("Total Amount cannot be negative");
     }
-    if (pendingAmount !== undefined && parseFloat(pendingAmount) < 0) {
+    if (pendingAmount !== undefined && pendingAmount !== null && String(pendingAmount).trim() !== "" && parseFloat(pendingAmount) < 0) {
       throw new Error("Pending Amount cannot be negative");
     }
 
@@ -52,13 +54,17 @@ const createOpeningBill = async (req, res) => {
       return res.status(400).json({ message: "Bill number already exists for this type in this company" });
     }
 
+    const total = round2(parseFloat(totalAmount) || 0);
+    const hasPending = pendingAmount !== undefined && pendingAmount !== null && String(pendingAmount).trim() !== "";
+    const pending = hasPending ? round2(parseFloat(pendingAmount) || 0) : total;
+
     const payload = {
       companyId,
       type,
       billNo: billNo.trim(),
       billDate,
-      totalAmount: parseFloat(totalAmount) || 0,
-      pendingAmount: parseFloat(pendingAmount) || 0,
+      totalAmount: total,
+      pendingAmount: pending,
       notes: notes?.trim() || "",
     };
 
@@ -117,11 +123,11 @@ const updateOpeningBill = async (req, res) => {
     if (billDate !== undefined) bill.billDate = billDate;
     if (totalAmount !== undefined) {
       if (parseFloat(totalAmount) < 0) throw new Error("Total Amount cannot be negative");
-      bill.totalAmount = parseFloat(totalAmount) || 0;
+      bill.totalAmount = round2(parseFloat(totalAmount) || 0);
     }
     if (pendingAmount !== undefined) {
       if (parseFloat(pendingAmount) < 0) throw new Error("Pending Amount cannot be negative");
-      bill.pendingAmount = parseFloat(pendingAmount) || 0;
+      bill.pendingAmount = round2(parseFloat(pendingAmount) || 0);
     }
     if (notes !== undefined) bill.notes = notes.trim() || "";
 

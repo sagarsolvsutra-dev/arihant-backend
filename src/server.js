@@ -110,6 +110,13 @@ app.use("/api/users", protect, scopeCompany, require("./routes/userRoutes"));
 // internally on req.user.role (super_admin gets a system-wide summary,
 // everyone else gets their own company's, scoped via req.effectiveCompanyId).
 app.use("/api/dashboard", protect, scopeCompany, require("./routes/dashboardRoutes"));
+// Notifications — same treatment as Dashboard above, and for the same
+// reason: the notification bell sits in AdminLayout's header on EVERY page,
+// so every logged-in user (staff included, regardless of their granted
+// modules) calls this route. Gating it behind any single module's
+// requirePermission would 403 the header for anyone without that grant.
+// Company-scoped via req.effectiveCompanyId inside the controller.
+app.use("/api/notifications", protect, scopeCompany, require("./routes/notificationRoutes"));
 
 // GST business-detail lookup (Customer/Supplier Add/Edit's GSTIN auto-fill,
 // see lib/gst.ts on the frontend) — just `protect`, no scopeCompany/

@@ -6,8 +6,11 @@ const OpeningBill = require("../models/OpeningBill");
 const Scheme = require("../models/Scheme");
 const CustomerGroup = require("../models/CustomerGroup");
 const Salesman = require("../models/Salesman");
+const Payment = require("../models/Payment");
 const { sendError } = require("../utils/errorHandler");
 const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
+
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 
 // A customer with `creditDays` unset/0 has no configured due-date policy at
 // all, so "overdue" has no meaning for them — never flagged, matching the
@@ -107,13 +110,21 @@ const getCustomerOutstanding = async (req, res) => {
     const customer = await Customer.findOne({ _id: req.params.id, companyId: req.effectiveCompanyId }).lean();
     if (!customer) return res.status(404).json({ message: "Customer not found" });
 
-    const rows = await Sale.aggregate([
-      { $match: { companyId: new mongoose.Types.ObjectId(String(customer.companyId)), customerId: customer._id } },
-      { $group: { _id: null, total: { $sum: "$pendingAmount" } } },
+    const [saleRows, openingRows] = await Promise.all([
+      Sale.aggregate([
+        { $match: { companyId: new mongoose.Types.ObjectId(String(customer.companyId)), customerId: customer._id } },
+        { $group: { _id: null, total: { $sum: "$pendingAmount" } } },
+      ]),
+      OpeningBill.aggregate([
+        { $match: { companyId: new mongoose.Types.ObjectId(String(customer.companyId)), type: "sale", customerId: customer._id } },
+        { $group: { _id: null, total: { $sum: "$pendingAmount" } } },
+      ]),
     ]);
 
+    const totalOutstanding = round2((saleRows[0]?.total || 0) + (openingRows[0]?.total || 0));
+
     res.status(200).json({
-      outstanding: rows[0]?.total || 0,
+      outstanding: totalOutstanding,
       creditLimit: customer.creditLimit || 0,
       creditDays: customer.creditDays || 0,
     });
@@ -138,6 +149,7 @@ const createCustomer = async (req, res) => {
   try {
     const {
       companyId, name, alias, contactPerson, mobile, phone, email, address, city, state, pincode,
+      shippingAddress, shippingCity, shippingState, shippingPincode,
       gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, uniqueIdNo, drugLicNo, customerType, balanceMethod, salesmanId, customerGroupId, routeNo, zoneNo, creditLimit, creditDays, isActive,
     } = req.body;
 
@@ -172,6 +184,12 @@ const createCustomer = async (req, res) => {
       city: city?.trim() || "",
       state: state?.trim() || "",
       pincode: pincode?.trim() || "",
+      // Ship To (delivery) address — optional; blank means "same as billing"
+      // and the invoice then prints a single address block.
+      shippingAddress: shippingAddress?.trim() || "",
+      shippingCity: shippingCity?.trim() || "",
+      shippingState: shippingState?.trim() || "",
+      shippingPincode: shippingPincode?.trim() || "",
       gstNo: gstNo?.trim() || "",
       panNo: panNo?.trim() || "",
       fssaiLicenseNumber: fssaiLicenseNumber?.trim() || "",
@@ -205,6 +223,7 @@ const updateCustomer = async (req, res) => {
 
     const {
       name, alias, contactPerson, mobile, phone, email, address, city, state, pincode,
+      shippingAddress, shippingCity, shippingState, shippingPincode,
       gstNo, panNo, fssaiLicenseNumber, fssaiIssueDate, fssaiExpiryDate, uniqueIdNo, drugLicNo, customerType, balanceMethod, salesmanId, customerGroupId, routeNo, zoneNo, creditLimit, creditDays, isActive,
     } = req.body;
 
@@ -225,6 +244,10 @@ const updateCustomer = async (req, res) => {
     if (city !== undefined) customer.city = city.trim() || "";
     if (state !== undefined) customer.state = state.trim() || "";
     if (pincode !== undefined) customer.pincode = pincode.trim() || "";
+    if (shippingAddress !== undefined) customer.shippingAddress = shippingAddress.trim() || "";
+    if (shippingCity !== undefined) customer.shippingCity = shippingCity.trim() || "";
+    if (shippingState !== undefined) customer.shippingState = shippingState.trim() || "";
+    if (shippingPincode !== undefined) customer.shippingPincode = shippingPincode.trim() || "";
     if (gstNo !== undefined) customer.gstNo = gstNo.trim() || "";
     if (panNo !== undefined) customer.panNo = panNo.trim() || "";
     if (fssaiLicenseNumber !== undefined) customer.fssaiLicenseNumber = fssaiLicenseNumber.trim() || "";
@@ -268,18 +291,19 @@ const deleteCustomer = async (req, res) => {
       return res.status(404).json({ message: "Customer not found" });
     }
 
-    // Sale.customerId, SaleReturn.customerId, and OpeningBill.customerId (type=sale)
-    // all reference Customer, as does Scheme.customerId. Hard-deleting a still-
-    // referenced Customer leaves each of those with a dangling ref.
-    const [hasSale, hasSaleReturn, hasOpeningBill, hasScheme] = await Promise.all([
+    // Sale.customerId, SaleReturn.customerId, OpeningBill.customerId (type=sale),
+    // Scheme.customerId, and Payment.partyId (Customer) all reference Customer.
+    // Hard-deleting a still-referenced Customer leaves dangling references.
+    const [hasSale, hasSaleReturn, hasOpeningBill, hasScheme, hasPayment] = await Promise.all([
       Sale.exists({ companyId: customer.companyId, customerId: customer._id }),
       SaleReturn.exists({ companyId: customer.companyId, customerId: customer._id }),
       OpeningBill.exists({ companyId: customer.companyId, customerId: customer._id }),
       Scheme.exists({ companyId: customer.companyId, customerId: customer._id }),
+      Payment.exists({ companyId: customer.companyId, partyType: "Customer", partyId: customer._id }),
     ]);
-    if (hasSale || hasSaleReturn || hasOpeningBill || hasScheme) {
+    if (hasSale || hasSaleReturn || hasOpeningBill || hasScheme || hasPayment) {
       return res.status(400).json({
-        message: "Cannot delete this customer — it is still referenced by Sales, Sale Returns, Opening Bills, or Schemes. Deactivate it instead.",
+        message: "Cannot delete this customer — it is still referenced by Sales, Sale Returns, Opening Bills, Schemes, or Payments. Deactivate it instead.",
       });
     }
 
@@ -297,4 +321,8 @@ module.exports = {
   createCustomer,
   updateCustomer,
   deleteCustomer,
+  // Exported so notificationController can reuse the one definition of
+  // "overdue" instead of keeping a second, drift-prone copy of the due-date
+  // rule. Not a route handler — nothing is mounted on it.
+  computeOverdueFlags,
 };

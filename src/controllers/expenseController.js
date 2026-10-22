@@ -5,6 +5,7 @@ const Narration = require("../models/Narration");
 const { searchRegex, clampLimit, clampPage, assertRefBelongsToCompany } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
 const { applyAccountEffect, reverseAccountEffect } = require("./accountController");
+const { sendLedgerPdf } = require("../utils/tallyPdf");
 
 // `narrationIds` (array of Narration _id strings from the client) is resolved
 // against the company's own Narration master and snapshotted into
@@ -75,6 +76,75 @@ const getExpenses = async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ message: error.message || "Server Error" });
+  }
+};
+
+// GET /api/expenses/export?companyId=&search=&dateFrom=&dateTo=
+// Tally-style "Ledger Account" PDF of the Expenses register — honours the
+// exact same search/dateFrom/dateTo filters getExpenses above accepts, so the
+// PDF always matches whatever the list page is currently showing. Unpaginated
+// by design: a statement needs the whole filtered set, not one page of it
+// (same choice the Ledgers and the Full Stock report already make).
+const exportExpenseStatement = async (req, res) => {
+  try {
+    const companyId = req.effectiveCompanyId;
+    const { search = "", dateFrom, dateTo } = req.query;
+
+    const query = { companyId };
+    if (search) query.title = searchRegex(search);
+    if (dateFrom || dateTo) {
+      query.expenseDate = {};
+      if (dateFrom) query.expenseDate.$gte = new Date(dateFrom);
+      if (dateTo) query.expenseDate.$lte = new Date(dateTo);
+    }
+
+    // Ascending, unlike getExpenses' newest-first list ordering — a ledger
+    // statement reads oldest-to-newest (see CLAUDE.md's ledger-ordering fix).
+    const expenses = await Expense.find(query)
+      .sort({ expenseDate: 1, createdAt: 1 })
+      .lean();
+
+    // Every expense is money out, i.e. a debit. There's no counter-party to
+    // credit here (this is a register of expenses, not a two-sided account),
+    // so credit is always 0 and the renderer's balancing Closing Balance row
+    // carries the total.
+    const entries = expenses.map((e) => {
+      const vchNo =
+        e.referenceNo ||
+        (Array.isArray(e.narrations) && e.narrations.length > 0
+          ? e.narrations.map((n) => n.code).filter(Boolean).join(", ")
+          : "") ||
+        "-";
+      return {
+        date: e.expenseDate,
+        particulars: e.category ? `${e.title} (${e.category})` : e.title,
+        type: "Expense",
+        vchType: "Expense",
+        vchNo,
+        ref: vchNo,
+        opposingDrCr: "Dr",
+        debit: e.amount,
+        credit: 0,
+      };
+    });
+
+    const Company = require("../models/Company");
+    const company = await Company.findById(companyId).lean();
+
+    await sendLedgerPdf(res, {
+      company,
+      // No single counter-party exists for a whole expense register.
+      party: { name: "Expenses" },
+      dateFrom,
+      dateTo,
+      ledger: { openingBalance: 0, entries },
+      filename: "Expenses_Statement.pdf",
+      isDebtor: false,
+    });
+  } catch (error) {
+    if (!res.headersSent) {
+      res.status(500).json({ message: error.message || "Server Error" });
+    }
   }
 };
 
@@ -164,6 +234,7 @@ const createExpense = async (req, res) => {
         amount: expenseAmount,
         referenceNo: referenceNo || "",
         notes: `Expense: ${title} (${category})`,
+        narrations: expense.narrations || [],
         allocations: []
       });
     } catch (err) {
@@ -318,6 +389,7 @@ const updateExpense = async (req, res) => {
       linkedPayment.paymentMode = expense.paymentMode;
       linkedPayment.bankAccountId = expense.bankAccountId;
       linkedPayment.referenceNo = expense.referenceNo;
+      linkedPayment.narrations = expense.narrations || [];
       await linkedPayment.save();
     }
 
@@ -329,6 +401,7 @@ const updateExpense = async (req, res) => {
 
 module.exports = {
   getExpenses,
+  exportExpenseStatement,
   getExpenseById,
   createExpense,
   updateExpense,

@@ -8,6 +8,7 @@ const BankAccount = require("../models/BankAccount");
 const Narration = require("../models/Narration");
 const { isValidObjectId } = require("../utils/queryHelpers");
 const { usesBankAccount } = require("../utils/paymentModes");
+const { sendLedgerPdf } = require("../utils/tallyPdf");
 
 // partyId is only ever a real Customer/Supplier when it came from the /payments
 // page itself (see DERIVED_PARTY_TYPES below for the two other partyTypes that
@@ -292,6 +293,84 @@ exports.getPayments = async (req, res) => {
   } catch (error) {
     console.error("Error fetching payments:", error);
     res.status(500).json({ message: "Error fetching payments", error: error.message });
+  }
+};
+
+// GET /api/payments/export?type=Receive|Pay&dateFrom=&dateTo=
+// Tally-style "Ledger Account" PDF of the whole payment register — honours
+// getPayments' own `type` filter, plus an optional date range (the renderer
+// prints a date range in its header, and a register without one is unbounded).
+// Unpaginated by design: a statement needs the full filtered set.
+exports.exportPaymentStatement = async (req, res) => {
+  try {
+    const companyId = req.effectiveCompanyId;
+    const { type, dateFrom, dateTo } = req.query;
+
+    const filter = { companyId };
+    if (type) filter.paymentType = type;
+    if (dateFrom || dateTo) {
+      filter.paymentDate = {};
+      if (dateFrom) filter.paymentDate.$gte = new Date(dateFrom);
+      if (dateTo) filter.paymentDate.$lte = new Date(dateTo);
+    }
+
+    // Ascending, unlike getPayments' newest-first list ordering — a ledger
+    // statement reads oldest-to-newest.
+    const payments = await Payment.find(filter)
+      .populate("partyId", "name companyName bankName accountNumber title category")
+      .sort({ paymentDate: 1, createdAt: 1 });
+
+    // Dr/Cr DIRECTION — a "Receive" is money IN and goes in DEBIT; a "Pay" is
+    // money OUT and goes in CREDIT. This is the register's own cash-movement
+    // view (what came in vs. what went out), not a party-side view, so it is
+    // deliberately the opposite assignment from the Bank Account statement
+    // above, which mirrors that page's existing Money In = Credit column.
+    const entries = payments.map((p) => {
+      const isIn = p.paymentType === "Receive";
+      const party = p.partyId || {};
+      let particulars;
+      if (p.partyType === "BankAccount") particulars = `${party.bankName || "Bank"} (Bank Transfer)`;
+      else if (p.partyType === "Expense") particulars = `${party.title || "Expense"} (Expense)`;
+      else particulars = party.name || party.companyName || p.paymentMode || "-";
+
+      const vchNo =
+        p.referenceNo ||
+        (Array.isArray(p.narrations) && p.narrations.length > 0
+          ? p.narrations.map((n) => n.code).filter(Boolean).join(", ")
+          : "") ||
+        "-";
+
+      return {
+        date: p.paymentDate,
+        particulars,
+        type: isIn ? "Receipt" : "Payment",
+        vchType: isIn ? "Receipt" : "Payment",
+        vchNo,
+        ref: vchNo,
+        opposingDrCr: isIn ? "Dr" : "Cr",
+        debit: isIn ? p.amount : 0,
+        credit: isIn ? 0 : p.amount,
+      };
+    });
+
+    const Company = require("../models/Company");
+    const company = await Company.findById(companyId).lean();
+
+    await sendLedgerPdf(res, {
+      company,
+      // No single counter-party exists across a whole payment register.
+      party: { name: "Payment Register" },
+      dateFrom,
+      dateTo,
+      ledger: { openingBalance: 0, entries },
+      filename: "Payments_Statement.pdf",
+      isDebtor: false,
+    });
+  } catch (error) {
+    console.error("Error exporting payment statement:", error);
+    if (!res.headersSent) {
+      res.status(500).json({ message: "Error exporting payment statement", error: error.message });
+    }
   }
 };
 

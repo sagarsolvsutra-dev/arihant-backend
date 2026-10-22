@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { XLSX, PDF, styleHeaderRow, styleTotalRow, styleDataRow } = require("../utils/exportTheme");
 const ExcelJS = require("exceljs");
 const PDFDocument = require("pdfkit");
 const Item = require("../models/Item");
@@ -14,6 +15,8 @@ const Payment = require("../models/Payment");
 const Company = require("../models/Company");
 const BankAccount = require("../models/BankAccount");
 const { searchRegex, clampLimit, clampPage, isValidObjectId } = require("../utils/queryHelpers");
+
+const round2 = (n) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
 
 // A report can be exported to Excel far larger than any one paginated page —
 // this is the same cap `exportListController.js` uses for its own exports.
@@ -38,8 +41,8 @@ function addExcelSheet(workbook, sheetName, columns, records) {
   });
   const headerRow = sheet.getRow(1);
   headerRow.eachCell((cell) => {
-    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF111111" } };
+    cell.font = { bold: true, color: { argb: XLSX.headerText }, size: 11 };
+    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: XLSX.headerBg } };
   });
   columns.forEach((c, i) => {
     if (c.align === "right") sheet.getColumn(i + 1).alignment = { horizontal: "right" };
@@ -70,6 +73,18 @@ async function sendExcelFile(res, sheetName, columns, records, filename) {
 // needs a title/subtitle/summary-cards header above this same table, to
 // visually match the on-screen Ledger page) can reuse the exact table
 // styling without duplicating the header-row/pagination logic.
+// Hard-truncates a string to the given pixel width using the font metrics
+// actually in effect, appending an ellipsis. drawDataTable draws fixed-height
+// rows, so a cell MUST occupy exactly one line — pdfkit's own lineBreak/
+// ellipsis options were tried first and did not reliably clamp (confirmed by
+// reading back generated PDFs), hence measuring and cutting here instead.
+function fitText(doc, str, maxWidth) {
+  let t = String(str ?? "-");
+  if (doc.widthOfString(t) <= maxWidth) return t;
+  while (t.length > 1 && doc.widthOfString(t + "…") > maxWidth) t = t.slice(0, -1);
+  return t + "…";
+}
+
 function drawDataTable(doc, columns, records, startY) {
   let y = startY;
   const startX = doc.page.margins.left;
@@ -81,11 +96,11 @@ function drawDataTable(doc, columns, records, startY) {
 
   function drawHeaderRow() {
     let x = startX;
-    doc.rect(startX, y, totalWidth, rowHeight).fill("#111111");
-    doc.fillColor("#fff").fontSize(9);
+    doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.headerBg);
+    doc.fillColor(PDF.headerText).fontSize(9);
     columns.forEach((c) => {
       const w = c.width * scale;
-      doc.text(c.header, x + 4, y + 6, { width: w - 8, align: c.align || "left" });
+      doc.text(fitText(doc, c.header, w - 8), x + 4, y + 6, { width: w - 8, align: c.align || "left", lineBreak: false });
       x += w;
     });
     y += rowHeight;
@@ -94,7 +109,7 @@ function drawDataTable(doc, columns, records, startY) {
   drawHeaderRow();
 
   if (records.length === 0) {
-    doc.fillColor("#888").fontSize(8.5).text("No records.", startX + 4, y + 4);
+    doc.fillColor(PDF.mutedText).fontSize(8.5).text("No records.", startX + 4, y + 4);
     y += rowHeight;
   }
 
@@ -105,15 +120,18 @@ function drawDataTable(doc, columns, records, startY) {
       drawHeaderRow();
     }
     if (idx % 2 === 1) {
-      doc.rect(startX, y, totalWidth, rowHeight).fill("#f5f5f5");
+      doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.zebraBg);
     }
     let x = startX;
-    doc.fillColor("#000").fontSize(8.5);
+    doc.fillColor(PDF.bodyText).fontSize(8.5);
     columns.forEach((c) => {
       const w = c.width * scale;
       let val = c.accessor(r);
       if (c.moneyCol) val = `Rs.${Number(val || 0).toFixed(2)}`;
-      doc.text(String(val ?? "-"), x + 4, y + 6, { width: w - 8, align: c.align || "left" });
+      // lineBreak:false is load-bearing, not cosmetic: rowHeight is fixed, so
+      // a cell allowed to wrap pushes its own text into the NEXT row's band
+      // and the table silently de-aligns from that row on.
+      doc.text(fitText(doc, val, w - 8), x + 4, y + 6, { width: w - 8, align: c.align || "left", lineBreak: false });
       x += w;
     });
     y += rowHeight;
@@ -122,19 +140,83 @@ function drawDataTable(doc, columns, records, startY) {
   return y;
 }
 
-async function sendPdfFile(res, title, columns, records, filename) {
-  const doc = new PDFDocument({ margin: 40, size: "A4", layout: "portrait" });
+async function sendPdfFile(res, title, columns, records, filename, company) {
+  // Wide reports (the Item Report alone now carries ~27 columns once every
+  // quantity also prints its Case/Loose split) are unreadable squeezed into
+  // portrait. Same >480pt rule exportController.js already uses.
+  const totalColsWidth = columns.reduce((s, c) => s + (c.width || 60), 0);
+  const layout = totalColsWidth > 480 ? "landscape" : "portrait";
+  const doc = new PDFDocument({ margin: 40, size: "A4", layout });
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   doc.pipe(res);
 
-  doc.fontSize(16).fillColor("#000").text(title);
-  doc.fontSize(9).fillColor("#666").text(`Generated ${new Date().toLocaleString("en-IN")}`);
-  const y = doc.y + 16;
+  const startX = doc.page.margins.left;
+  const innerWidth = doc.page.width - doc.page.margins.left - doc.page.margins.right;
+
+  // Company letterhead — the same name/address/PH/GSTIN block the Tally
+  // ledger PDFs print, so every PDF this app produces is recognisably on the
+  // same stationery. Values come from the Company record, which a
+  // company_admin maintains themselves on the Settings page.
+  if (company?.name) {
+    doc.font("Helvetica-Bold").fontSize(13).fillColor("#000")
+      .text(String(company.name).toUpperCase(), startX, doc.y, { width: innerWidth, align: "center" });
+    if (company.address) {
+      doc.font("Helvetica").fontSize(8.5).fillColor("#333")
+        .text(String(company.address).toUpperCase(), startX, doc.y + 1, { width: innerWidth, align: "center" });
+    }
+    const sub = [];
+    if (company.phone) sub.push(`PH: ${company.phone}`);
+    if (company.gstNo) sub.push(`GSTIN: ${company.gstNo}`);
+    if (sub.length) {
+      doc.font("Helvetica").fontSize(8).fillColor("#444")
+        .text(sub.join("  |  "), startX, doc.y + 1, { width: innerWidth, align: "center" });
+    }
+    doc.moveDown(0.6);
+  }
+
+  doc.font("Helvetica-Bold").fontSize(13).fillColor(PDF.accent)
+    .text(title, startX, doc.y, { width: innerWidth, align: "center" });
+  doc.font("Helvetica").fontSize(8).fillColor(PDF.mutedText)
+    .text(`Generated ${new Date().toLocaleString("en-IN")}`, startX, doc.y + 1, { width: innerWidth, align: "center" });
+  // Quantity cells print compactly as "23C 10P" so 12+ columns still fit a
+  // landscape page without the numbers themselves getting truncated.
+  if (columns.some((c) => c.qtyLegend)) {
+    doc.fontSize(7.5).fillColor(PDF.mutedText)
+      .text("Quantities shown as  <Case>C <Loose Pcs>P", startX, doc.y + 1, { width: innerWidth, align: "center" });
+  }
+  const y = doc.y + 14;
 
   drawDataTable(doc, columns, records, y);
 
   doc.end();
+}
+
+// Every report export endpoint accepts ?format=pdf alongside its default
+// Excel. Both formats are driven off the SAME `columns` array, so a column
+// added to one can never silently go missing from the other.
+async function sendReportFile(res, { format, company, title, columns, pdfColumns, records, baseFilename }) {
+  if (String(format || "").toLowerCase() === "pdf") {
+    // A spreadsheet can carry 28 columns and still be usable; a printed page
+    // cannot. `pdfColumns` lets a wide report collapse its Case/Loose/total
+    // triples into one "N Case M Pcs" cell for print while the Excel export
+    // keeps every figure in its own sortable column.
+    return sendPdfFile(res, title, pdfColumns || columns, records, `${baseFilename}.pdf`, company);
+  }
+  return sendExcelFile(res, title, columns, records, `${baseFilename}.xlsx`);
+}
+
+// Letterhead for any PDF this controller emits. Scoped by
+// req.effectiveCompanyId (the value scopeCompany actually computed), never
+// req.user.companyId — see CLAUDE.md quirk #62.
+async function loadCompanyLetterhead(req) {
+  try {
+    const cid = req.effectiveCompanyId || req.query.companyId;
+    if (!cid || !isValidObjectId(cid)) return null;
+    return await Company.findById(cid).select("name address phone gstNo").lean();
+  } catch {
+    return null;
+  }
 }
 
 // Stat-card boxes (label above a bold value) drawn side-by-side across the
@@ -163,248 +245,11 @@ function drawSummaryCards(doc, cards, startY) {
   return startY + cardHeight + 18;
 }
 
-function fmtTallyDate(d) {
-  if (!d) return "-";
-  const date = new Date(d);
-  if (isNaN(date.getTime())) return "-";
-  const day = date.getDate();
-  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  const mon = months[date.getMonth()];
-  const yy = String(date.getFullYear()).slice(-2);
-  return `${day}-${mon}-${yy}`;
-}
-
-function fmtIndianNumber(num) {
-  if (num === null || num === undefined || isNaN(num) || Number(num) === 0) return "";
-  return Number(num).toLocaleString("en-IN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
-function fmtIndianTotal(num) {
-  return Number(num || 0).toLocaleString("en-IN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
-// Tally-style authentic Ledger Account PDF generator matching standard Indian accounting printouts:
-// Centered Company details, Centered Party name (bold, underlined), "Ledger Account",
-// Centered Party address, Date range, Page indicator,
-// Table with Date (with Dr/Cr indicator), Particulars, Vch Type, Vch No., Debit, Credit,
-// Subtotals, Closing Balance balancing row, and matched Grand Totals with double bottom rules.
-async function sendLedgerPdf(res, { company, party, dateFrom, dateTo, ledger, filename, isDebtor = false }) {
-  const doc = new PDFDocument({ margin: 36, size: "A4", layout: "portrait" });
-  res.setHeader("Content-Type", "application/pdf");
-  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-  doc.pipe(res);
-
-  let pageNum = 1;
-  const tableWidth = 523;
-  const startX = 36;
-  const endX = startX + tableWidth;
-
-  function renderHeader(isFirstPage) {
-    let y = 36;
-    if (isFirstPage) {
-      // Company name (Centered, uppercase, bold)
-      const compName = (company?.name || "ARIHANT ENTERPRISE").toUpperCase();
-      doc.font("Helvetica-Bold").fontSize(13).fillColor("#000").text(compName, startX, y, { width: tableWidth, align: "center" });
-      y = doc.y + 2;
-
-      // Company address lines (Centered)
-      if (company?.address) {
-        doc.font("Helvetica").fontSize(8.5).fillColor("#333").text(company.address.toUpperCase(), startX, y, { width: tableWidth, align: "center" });
-        y = doc.y + 1;
-      }
-      const compSub = [];
-      if (company?.phone) compSub.push(`PH: ${company.phone}`);
-      if (company?.gstNo) compSub.push(`GSTIN: ${company.gstNo}`);
-      if (compSub.length > 0) {
-        doc.font("Helvetica").fontSize(8).fillColor("#444").text(compSub.join("  |  "), startX, y, { width: tableWidth, align: "center" });
-        y = doc.y + 1;
-      }
-
-      y += 8;
-
-      // Party Name (Centered, uppercase, bold, underlined)
-      const partyName = (party?.name || "PARTY").toUpperCase();
-      doc.font("Helvetica-Bold").fontSize(11).fillColor("#000").text(partyName, startX, y, { width: tableWidth, align: "center", underline: true });
-      y = doc.y + 3;
-
-      doc.font("Helvetica").fontSize(9).fillColor("#333").text("Ledger Account", startX, y, { width: tableWidth, align: "center" });
-      y = doc.y + 2;
-
-      // Party address lines (Centered)
-      const partyAddrParts = [];
-      if (party?.address) partyAddrParts.push(party.address.toUpperCase());
-      if (party?.city) partyAddrParts.push(party.city.toUpperCase());
-      if (party?.state) partyAddrParts.push(party.state.toUpperCase());
-      if (party?.pincode) partyAddrParts.push(party.pincode);
-      if (partyAddrParts.length > 0) {
-        doc.font("Helvetica").fontSize(8).fillColor("#444").text(partyAddrParts.join(", "), startX, y, { width: tableWidth, align: "center" });
-        y = doc.y + 1;
-      }
-      if (party?.gstNo) {
-        doc.font("Helvetica").fontSize(8).fillColor("#444").text(`GSTIN: ${party.gstNo}`, startX, y, { width: tableWidth, align: "center" });
-        y = doc.y + 1;
-      }
-
-      y += 8;
-
-      // Date Range (Centered)
-      const fromStr = dateFrom ? fmtTallyDate(dateFrom) : (ledger.entries?.[0]?.date ? fmtTallyDate(ledger.entries[0].date) : "1-Apr-26");
-      const toStr = dateTo ? fmtTallyDate(dateTo) : (ledger.entries?.length ? fmtTallyDate(ledger.entries[ledger.entries.length - 1].date) : fmtTallyDate(new Date()));
-      doc.font("Helvetica").fontSize(8.5).fillColor("#000").text(`${fromStr} to ${toStr}`, startX, y, { width: tableWidth, align: "center" });
-      y = doc.y + 4;
-    } else {
-      // Subsequent pages header
-      const partyName = (party?.name || "PARTY").toUpperCase();
-      doc.font("Helvetica-Bold").fontSize(10).fillColor("#000").text(`${partyName} — Ledger Account (Contd.)`, startX, y, { width: tableWidth, align: "center" });
-      y = doc.y + 6;
-    }
-
-    // Right-aligned Page Number
-    doc.font("Helvetica").fontSize(8).fillColor("#333").text(`Page ${pageNum}`, startX, y, { width: tableWidth, align: "right" });
-    y = doc.y + 4;
-
-    // Table Header horizontal top line
-    doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
-    y += 3;
-
-    // Header column names
-    doc.font("Helvetica-Bold").fontSize(8.5).fillColor("#000");
-    doc.text("Date", 36, y, { width: 74 });
-    doc.text("Particulars", 112, y, { width: 200 });
-    doc.text("Vch Type", 314, y, { width: 66 });
-    doc.text("Vch No.", 382, y, { width: 44 });
-    doc.text("Debit", 428, y, { width: 64, align: "right" });
-    doc.text("Credit", 494, y, { width: 65, align: "right" });
-
-    y += 12;
-    // Table Header horizontal bottom line
-    doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
-    y += 4;
-
-    return y;
-  }
-
-  let y = renderHeader(true);
-  const bottomMargin = 45;
-
-  function checkPageBreak(neededHeight = 16) {
-    if (y + neededHeight > doc.page.height - bottomMargin) {
-      doc.addPage();
-      pageNum++;
-      y = renderHeader(false);
-    }
-  }
-
-  // Opening balance row
-  const openBal = ledger.openingBalance || 0;
-  let openDebit = 0;
-  let openCredit = 0;
-  if (isDebtor) {
-    openDebit = openBal > 0 ? openBal : 0;
-    openCredit = openBal < 0 ? Math.abs(openBal) : 0;
-  } else {
-    openDebit = openBal < 0 ? Math.abs(openBal) : 0;
-    openCredit = openBal > 0 ? openBal : 0;
-  }
-
-  const openDateStr = dateFrom ? fmtTallyDate(dateFrom) : (ledger.entries?.[0]?.date ? fmtTallyDate(ledger.entries[0].date) : "1-Apr-26");
-  const openTag = openCredit > 0 ? "Dr" : (openDebit > 0 ? "Cr" : "Dr");
-
-  if (openBal !== 0 || dateFrom) {
-    checkPageBreak(14);
-    doc.font("Helvetica").fontSize(8).fillColor("#000");
-    doc.text(`${openDateStr}  ${openTag}`, 36, y, { width: 74 });
-    doc.font("Helvetica-Bold").text("Opening Balance", 112, y, { width: 200 });
-    doc.font("Helvetica");
-    if (openDebit > 0) doc.text(fmtIndianNumber(openDebit), 428, y, { width: 64, align: "right" });
-    if (openCredit > 0) doc.text(fmtIndianNumber(openCredit), 494, y, { width: 65, align: "right" });
-    y += 13;
-  }
-
-  let totalDebit = openDebit;
-  let totalCredit = openCredit;
-
-  // Transaction rows
-  for (const entry of (ledger.entries || [])) {
-    const dVal = Number(entry.debit || 0);
-    const cVal = Number(entry.credit || 0);
-    totalDebit += dVal;
-    totalCredit += cVal;
-
-    checkPageBreak(14);
-
-    const tag = entry.opposingDrCr || (cVal > 0 ? "Dr" : "Cr");
-    const dateStr = `${fmtTallyDate(entry.date)}  ${tag}`;
-    const particularText = entry.particulars || entry.type || "-";
-    const vchType = entry.vchType || (entry.type && entry.type.includes("Payment") ? "Payment" : entry.type || "-");
-    const vchNo = entry.vchNo || entry.ref || "-";
-
-    doc.font("Helvetica").fontSize(8).fillColor("#000");
-    doc.text(dateStr, 36, y, { width: 74 });
-    doc.text(particularText, 112, y, { width: 200, ellipsis: true });
-    doc.text(vchType, 314, y, { width: 66, ellipsis: true });
-    doc.text(String(vchNo), 382, y, { width: 44, ellipsis: true });
-    if (dVal > 0) doc.text(fmtIndianNumber(dVal), 428, y, { width: 64, align: "right" });
-    if (cVal > 0) doc.text(fmtIndianNumber(cVal), 494, y, { width: 65, align: "right" });
-
-    y += 13;
-  }
-
-  // Totals & Balancing Section (requires ~45pt)
-  checkPageBreak(45);
-
-  // Subtotal top line
-  doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
-  y += 3;
-
-  // Subtotal amounts
-  doc.font("Helvetica").fontSize(8).fillColor("#000");
-  doc.text(fmtIndianTotal(totalDebit), 428, y, { width: 64, align: "right" });
-  doc.text(fmtIndianTotal(totalCredit), 494, y, { width: 65, align: "right" });
-  y += 12;
-
-  // Closing Balance row
-  const diff = Math.abs(totalCredit - totalDebit);
-  const roundedDiff = Math.round(diff * 100) / 100;
-  if (roundedDiff > 0.001) {
-    const isCreditGreater = totalCredit > totalDebit;
-    const closeTag = isCreditGreater ? "Cr" : "Dr";
-    doc.font("Helvetica-Bold").fontSize(8).fillColor("#000");
-    doc.text(`${closeTag}   Closing Balance`, 76, y, { width: 236 });
-    doc.font("Helvetica");
-    if (isCreditGreater) {
-      // Put in Debit column to balance
-      doc.text(fmtIndianTotal(diff), 428, y, { width: 64, align: "right" });
-    } else {
-      // Put in Credit column to balance
-      doc.text(fmtIndianTotal(diff), 494, y, { width: 65, align: "right" });
-    }
-    y += 12;
-  }
-
-  // Grand Total top line
-  doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
-  y += 3;
-
-  // Grand Total amounts (Identical on both sides!)
-  const maxTotal = Math.max(totalDebit, totalCredit);
-  doc.font("Helvetica-Bold").fontSize(8.5).fillColor("#000");
-  doc.text(fmtIndianTotal(maxTotal), 428, y, { width: 64, align: "right" });
-  doc.text(fmtIndianTotal(maxTotal), 494, y, { width: 65, align: "right" });
-  y += 12;
-
-  // Double bottom line
-  doc.moveTo(startX, y).lineTo(endX, y).lineWidth(0.5).strokeColor("#000").stroke();
-  doc.moveTo(startX, y + 2.5).lineTo(endX, y + 2.5).lineWidth(0.5).strokeColor("#000").stroke();
-
-  doc.end();
-}
+// The Tally-style Ledger Account PDF renderer (and its Indian-format date/
+// number helpers) now lives in utils/tallyPdf.js so the Bank Account,
+// Account, Expense and Payment statements print on the identical
+// letterhead and table as the Customer/Supplier ledgers below.
+const { sendLedgerPdf } = require("../utils/tallyPdf");
 
 function fmtDate(d) {
   if (!d) return "-";
@@ -492,21 +337,54 @@ const getItemReport = async (req, res) => {
       const sold = saleMap.get(id) || zero;
       const purchaseReturned = purchaseReturnMap.get(id) || zero;
       const saleReturned = saleReturnMap.get(id) || zero;
+      const packing = item.packing || 1;
+      // Every quantity on this report was previously a bare total-pieces
+      // number. A wholesale distributor reads stock as "Carton + loose
+      // pieces", so each one now ALSO carries its Case/Loose split, keyed
+      // off this item's own packing. splitCasePcsTrunc (not lib/stock.ts's
+      // Math.floor-based splitCasePcs) truncates toward zero, so a negative
+      // figure reads as "0 Case -3 Pcs" rather than "-1 Case 47 Pcs" — the
+      // same convention the Full Report already uses.
+      const split = (totalPcs) => {
+        const { caseQty, pcs } = splitCasePcsTrunc(totalPcs, packing);
+        return { case: caseQty, loose: pcs };
+      };
+      const purchasedSplit = split(purchased.qty);
+      const soldSplit = split(sold.qty);
+      const purchaseReturnedSplit = split(purchaseReturned.qty);
+      const saleReturnedSplit = split(saleReturned.qty);
+      const freshSplit = split(item.openingStockFreshPcs || 0);
+      const expiredSplit = split(item.openingStockExpiredPcs || 0);
+      const damagedSplit = split(item.openingStockDamagedPcs || 0);
       return {
         itemId: item._id,
         itemName: item.itemName,
         subGroupName: item.itemSubGroupId?.name || null,
-        packing: item.packing || 1,
+        packing,
         currentStockFreshPcs: item.openingStockFreshPcs || 0,
         currentStockExpiredPcs: item.openingStockExpiredPcs || 0,
         currentStockDamagedPcs: item.openingStockDamagedPcs || 0,
+        currentStockFreshCase: freshSplit.case,
+        currentStockFreshLoosePcs: freshSplit.loose,
+        currentStockExpiredCase: expiredSplit.case,
+        currentStockExpiredLoosePcs: expiredSplit.loose,
+        currentStockDamagedCase: damagedSplit.case,
+        currentStockDamagedLoosePcs: damagedSplit.loose,
         purchasedQty: purchased.qty,
+        purchasedCase: purchasedSplit.case,
+        purchasedLoosePcs: purchasedSplit.loose,
         purchasedAmount: purchased.amount,
         soldQty: sold.qty,
+        soldCase: soldSplit.case,
+        soldLoosePcs: soldSplit.loose,
         soldAmount: sold.amount,
         purchaseReturnedQty: purchaseReturned.qty,
+        purchaseReturnedCase: purchaseReturnedSplit.case,
+        purchaseReturnedLoosePcs: purchaseReturnedSplit.loose,
         purchaseReturnedAmount: purchaseReturned.amount,
         saleReturnedQty: saleReturned.qty,
+        saleReturnedCase: saleReturnedSplit.case,
+        saleReturnedLoosePcs: saleReturnedSplit.loose,
         saleReturnedAmount: saleReturned.amount,
       };
     });
@@ -793,6 +671,13 @@ async function buildLineReport({
             godownId: "$items.godownId",
             caseQty: "$items.caseQty",
             pcsQty: "$items.pcsQty",
+            // The line already stored its own Case/Pcs, but not the total
+            // physical pieces those add up to, nor the packing they were
+            // computed against — both are needed to show "N Case + M Pcs
+            // (= T pcs)" consistently with the Item/Full reports.
+            totalPieces: "$items.totalPieces",
+            freeQty: "$items.freeQty",
+            packing: "$items.packing",
             taxableValue: "$items.taxableValue",
             gstAmount: "$items.gstAmount",
             netValue: "$items.netValue",
@@ -805,6 +690,9 @@ async function buildLineReport({
           $group: {
             _id: null,
             count: { $sum: 1 },
+            caseQty: { $sum: "$items.caseQty" },
+            pcsQty: { $sum: "$items.pcsQty" },
+            totalPieces: { $sum: "$items.totalPieces" },
             taxableValue: { $sum: "$items.taxableValue" },
             gstAmount: { $sum: "$items.gstAmount" },
             netValue: { $sum: "$items.netValue" },
@@ -816,7 +704,7 @@ async function buildLineReport({
 
   const [result] = await Model.aggregate(pipeline);
   const data = result?.data || [];
-  const totalsRow = result?.totals?.[0] || { count: 0, taxableValue: 0, gstAmount: 0, netValue: 0 };
+  const totalsRow = result?.totals?.[0] || { count: 0, caseQty: 0, pcsQty: 0, totalPieces: 0, taxableValue: 0, gstAmount: 0, netValue: 0 };
   return { data, totalsRow };
 }
 
@@ -858,7 +746,14 @@ const getPurchaseReport = async (req, res) => {
 
     res.status(200).json({
       data,
-      totals: { taxableValue: totalsRow.taxableValue, gstAmount: totalsRow.gstAmount, netValue: totalsRow.netValue },
+      totals: {
+        caseQty: totalsRow.caseQty || 0,
+        pcsQty: totalsRow.pcsQty || 0,
+        totalPieces: totalsRow.totalPieces || 0,
+        taxableValue: round2(totalsRow.taxableValue),
+        gstAmount: round2(totalsRow.gstAmount),
+        netValue: round2(totalsRow.netValue),
+      },
       pagination: { total: totalsRow.count, page: parsedPage, limit: parsedLimit, totalPages: Math.ceil(totalsRow.count / parsedLimit) },
     });
   } catch (error) {
@@ -897,7 +792,14 @@ const getSaleReport = async (req, res) => {
 
     res.status(200).json({
       data,
-      totals: { taxableValue: totalsRow.taxableValue, gstAmount: totalsRow.gstAmount, netValue: totalsRow.netValue },
+      totals: {
+        caseQty: totalsRow.caseQty || 0,
+        pcsQty: totalsRow.pcsQty || 0,
+        totalPieces: totalsRow.totalPieces || 0,
+        taxableValue: round2(totalsRow.taxableValue),
+        gstAmount: round2(totalsRow.gstAmount),
+        netValue: round2(totalsRow.netValue),
+      },
       pagination: { total: totalsRow.count, page: parsedPage, limit: parsedLimit, totalPages: Math.ceil(totalsRow.count / parsedLimit) },
     });
   } catch (error) {
@@ -937,7 +839,14 @@ const getPurchaseReturnReport = async (req, res) => {
 
     res.status(200).json({
       data,
-      totals: { taxableValue: totalsRow.taxableValue, gstAmount: totalsRow.gstAmount, netValue: totalsRow.netValue },
+      totals: {
+        caseQty: totalsRow.caseQty || 0,
+        pcsQty: totalsRow.pcsQty || 0,
+        totalPieces: totalsRow.totalPieces || 0,
+        taxableValue: round2(totalsRow.taxableValue),
+        gstAmount: round2(totalsRow.gstAmount),
+        netValue: round2(totalsRow.netValue),
+      },
       pagination: { total: totalsRow.count, page: parsedPage, limit: parsedLimit, totalPages: Math.ceil(totalsRow.count / parsedLimit) },
     });
   } catch (error) {
@@ -977,7 +886,14 @@ const getSaleReturnReport = async (req, res) => {
 
     res.status(200).json({
       data,
-      totals: { taxableValue: totalsRow.taxableValue, gstAmount: totalsRow.gstAmount, netValue: totalsRow.netValue },
+      totals: {
+        caseQty: totalsRow.caseQty || 0,
+        pcsQty: totalsRow.pcsQty || 0,
+        totalPieces: totalsRow.totalPieces || 0,
+        taxableValue: round2(totalsRow.taxableValue),
+        gstAmount: round2(totalsRow.gstAmount),
+        netValue: round2(totalsRow.netValue),
+      },
       pagination: { total: totalsRow.count, page: parsedPage, limit: parsedLimit, totalPages: Math.ceil(totalsRow.count / parsedLimit) },
     });
   } catch (error) {
@@ -1016,9 +932,10 @@ function buildLedger(entries, dateFrom, dateTo, { debitIncreases = true } = {}) 
     }
   });
 
+  openingBalance = round2(openingBalance);
   let running = openingBalance;
   const rows = inRange.map((e) => {
-    running += delta(e);
+    running = round2(running + delta(e));
     return { ...e, balance: running };
   });
 
@@ -1562,6 +1479,13 @@ async function buildFullStockReport(query, { cap = FULL_STOCK_ROW_CAP } = {}) {
       mrpRate: item.mrp || 0,
       rate,
       value: closingPcs * ratePerPiece,
+      // The report already carried a per-piece Weight column but never
+      // totalled it anywhere — so the one question a stock report with a
+      // Weight column exists to answer ("how much does the stock on hand
+      // weigh?") had no answer. Closing weight closes that gap and, unlike
+      // Case/Loose, is genuinely additive across items of different packing,
+      // so its group/grand totals are meaningful.
+      closingWeight: closingPcs * (item.weightPerPiece || 0),
     };
   });
 
@@ -1576,7 +1500,7 @@ async function buildFullStockReport(query, { cap = FULL_STOCK_ROW_CAP } = {}) {
       openingPcs: 0, purchasePcs: 0, salePcs: 0, closingPcs: 0,
       openingCase: 0, openingLoosePcs: 0, purchaseCase: 0, purchaseLoosePcs: 0,
       saleCase: 0, saleLoosePcs: 0, closingCase: 0, closingLoosePcs: 0,
-      value: 0,
+      value: 0, closingWeight: 0,
     };
     rows.forEach((r) => {
       s.openingPcs += r.openingPcs; s.purchasePcs += r.purchasePcs; s.salePcs += r.salePcs; s.closingPcs += r.closingPcs;
@@ -1585,6 +1509,7 @@ async function buildFullStockReport(query, { cap = FULL_STOCK_ROW_CAP } = {}) {
       s.saleCase += r.saleCase; s.saleLoosePcs += r.saleLoosePcs;
       s.closingCase += r.closingCase; s.closingLoosePcs += r.closingLoosePcs;
       s.value += r.value;
+      s.closingWeight += r.closingWeight;
     });
     return s;
   }
@@ -1630,20 +1555,48 @@ const exportFullStockReport = async (req, res) => {
     }
     const { groups, grandTotal } = await buildFullStockReport(req.query, { cap: EXPORT_ROW_CAP });
 
+    // PDF path. Hand-built like the Excel one rather than going through
+    // sendReportFile/drawDataTable, for the same reason the Excel sheet is
+    // hand-built: this report has TWO tiers of total row (a GROUP TOTAL after
+    // every supplier, then one GRAND TOTAL) and the shared table helper only
+    // knows how to append a single trailing total.
+    if (String(req.query.format || "").toLowerCase() === "pdf") {
+      const company = await loadCompanyLetterhead(req);
+      const fsCols = [
+        { header: "Item Code", width: 52, accessor: (r) => r.itemCode || "-" },
+        { header: "Item", width: 104, accessor: (r) => r.itemName },
+        { header: "Unit", width: 32, accessor: (r) => r.unit || "-" },
+        { header: "Pack", width: 30, accessor: (r) => r.packing, align: "right" },
+        { header: "Opening", width: 58, accessor: (r) => caseLooseText(r.openingCase, r.openingLoosePcs), align: "right" , qtyLegend: true },
+        { header: "Purchase", width: 58, accessor: (r) => caseLooseText(r.purchaseCase, r.purchaseLoosePcs), align: "right" , qtyLegend: true },
+        { header: "Sale", width: 58, accessor: (r) => caseLooseText(r.saleCase, r.saleLoosePcs), align: "right" , qtyLegend: true },
+        { header: "Closing", width: 58, accessor: (r) => caseLooseText(r.closingCase, r.closingLoosePcs), align: "right" , qtyLegend: true },
+        { header: "MRP", width: 42, accessor: (r) => (r.mrpRate ? fmtNum(r.mrpRate) : "-"), align: "right" },
+        { header: "Rate", width: 48, accessor: (r) => (r.rate ? fmtNum(r.rate) : "-"), align: "right" },
+        { header: "Value", width: 60, accessor: (r) => fmtNum(r.value), align: "right" },
+        { header: "Clsg Wt", width: 48, accessor: (r) => fmtNum(r.closingWeight, 3), align: "right" },
+      ];
+      // One flat record list with a marker row after each group, so the
+      // shared drawDataTable pagination still applies to the whole thing.
+      const flat = [];
+      groups.forEach((g) => {
+        g.rows.forEach((r) => flat.push(r));
+        flat.push({ ...g.total, itemCode: "", itemName: `${g.groupName} — GROUP TOTAL`, unit: "", packing: "", mrpRate: 0, rate: 0, __isTotal: true });
+      });
+      flat.push({ ...grandTotal, itemCode: "", itemName: "GRAND TOTAL", unit: "", packing: "", mrpRate: 0, rate: 0, __isTotal: true });
+      return sendPdfFile(res, "Full Stock Report", fsCols, flat, "Full_Stock_Report.pdf", company);
+    }
+
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet("Full Stock Report");
     const headers = [
       "Group", "Item Code", "HSN Code", "Item", "Unit", "Weight", "Packing",
       "Opening", "Purchase", "Sale", "Closing",
       "Opng Case", "Opng Pcs", "Purc Case", "Purc Pcs", "Sale Case", "Sale Pcs", "Clsg Case", "Clsg Pcs",
-      "MRP Rate", "Rate", "Value",
+      "MRP Rate", "Rate", "Value", "Closing Weight",
     ];
     sheet.addRow(headers);
-    const headerRow = sheet.getRow(1);
-    headerRow.eachCell((cell) => {
-      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-      cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF111111" } };
-    });
+    styleHeaderRow(sheet.getRow(1));
     sheet.columns.forEach((col) => { col.width = 13; });
     sheet.getColumn(4).width = 28;
 
@@ -1652,25 +1605,28 @@ const exportFullStockReport = async (req, res) => {
       r.openingPcs, r.purchasePcs, r.salePcs, r.closingPcs,
       r.openingCase, r.openingLoosePcs, r.purchaseCase, r.purchaseLoosePcs,
       r.saleCase, r.saleLoosePcs, r.closingCase, r.closingLoosePcs,
-      r.mrpRate, r.rate, Number(r.value.toFixed(2)),
+      r.mrpRate, r.rate, Number(r.value.toFixed(2)), Number((r.closingWeight || 0).toFixed(3)),
     ];
     const totalValues = (label, t) => [
       label, "", "", "", "", "", "",
       t.openingPcs, t.purchasePcs, t.salePcs, t.closingPcs,
       t.openingCase, t.openingLoosePcs, t.purchaseCase, t.purchaseLoosePcs,
       t.saleCase, t.saleLoosePcs, t.closingCase, t.closingLoosePcs,
-      "", "", Number(t.value.toFixed(2)),
+      "", "", Number(t.value.toFixed(2)), Number((t.closingWeight || 0).toFixed(3)),
     ];
 
     groups.forEach((g) => {
       g.rows.forEach((r) => sheet.addRow(rowValues(r)));
       const totalRow = sheet.addRow(totalValues(`${g.groupName} - GROUP TOTAL`, g.total));
-      totalRow.font = { bold: true };
-      totalRow.eachCell((cell) => { cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF0F0F0" } }; });
+      // Group subtotals use the soft brand tint; the GRAND TOTAL below uses
+      // the full brand fill so the two tiers stay visually distinct.
+      totalRow.eachCell((cell) => {
+        cell.font = { bold: true, color: { argb: XLSX.bodyText } };
+        cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: XLSX.groupBg } };
+      });
     });
     const grandRow = sheet.addRow(totalValues("GRAND TOTAL", grandTotal));
-    grandRow.font = { bold: true };
-    grandRow.eachCell((cell) => { cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFDDDDDD" } }; });
+    styleTotalRow(grandRow);
 
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename="Full_Stock_Report.xlsx"`);
@@ -1684,6 +1640,17 @@ const exportFullStockReport = async (req, res) => {
 async function godownNameMap(companyId) {
   const list = await Godown.find({ companyId }).select("name").lean();
   return new Map(list.map((g) => [String(g._id), g.name]));
+}
+
+// "12 Case 5 Pcs" with the raw piece total underneath it — the same
+// Case+Loose presentation the on-screen Full Report uses, so the PDF and the
+// page read identically.
+function caseLooseText(caseQty, loosePcs) {
+  return `${caseQty}C ${loosePcs}P`;
+}
+
+function fmtNum(n, dp = 2) {
+  return Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: dp, maximumFractionDigits: dp });
 }
 
 function sendExportError(res, error) {
@@ -1745,24 +1712,74 @@ const exportItemReport = async (req, res) => {
       };
     });
 
+    // Every quantity is exported as total pieces AND its Case/Loose split,
+    // keyed off that row's own packing — a distributor reads stock as
+    // "Carton + loose pieces", and a bare piece count is unusable on the
+    // warehouse floor. `cs`/`ls` mirror the on-screen report exactly.
+    const cs = (r, pcs) => splitCasePcsTrunc(pcs, r.packing).caseQty;
+    const ls = (r, pcs) => splitCasePcsTrunc(pcs, r.packing).pcs;
     const columns = [
       { header: "Item Name", width: 130, accessor: (r) => r.itemName },
       { header: "Sub Group", width: 100, accessor: (r) => r.subGroupName },
       { header: "Packing", width: 60, accessor: (r) => r.packing, align: "right" },
       { header: "Purchased Qty", width: 80, accessor: (r) => r.purchased.qty, align: "right" },
+      { header: "Purchased Case", width: 85, accessor: (r) => cs(r, r.purchased.qty), align: "right" },
+      { header: "Purchased Loose Pcs", width: 100, accessor: (r) => ls(r, r.purchased.qty), align: "right" },
       { header: "Purchased Amt", width: 90, accessor: (r) => r.purchased.amount, align: "right", moneyCol: true },
       { header: "Sold Qty", width: 70, accessor: (r) => r.sold.qty, align: "right" },
+      { header: "Sold Case", width: 70, accessor: (r) => cs(r, r.sold.qty), align: "right" },
+      { header: "Sold Loose Pcs", width: 85, accessor: (r) => ls(r, r.sold.qty), align: "right" },
       { header: "Sold Amt", width: 90, accessor: (r) => r.sold.amount, align: "right", moneyCol: true },
       { header: "Pur. Return Qty", width: 90, accessor: (r) => r.purchaseReturned.qty, align: "right" },
+      { header: "Pur. Return Case", width: 95, accessor: (r) => cs(r, r.purchaseReturned.qty), align: "right" },
+      { header: "Pur. Return Loose Pcs", width: 105, accessor: (r) => ls(r, r.purchaseReturned.qty), align: "right" },
       { header: "Pur. Return Amt", width: 90, accessor: (r) => r.purchaseReturned.amount, align: "right", moneyCol: true },
       { header: "Sale Return Qty", width: 90, accessor: (r) => r.saleReturned.qty, align: "right" },
+      { header: "Sale Return Case", width: 95, accessor: (r) => cs(r, r.saleReturned.qty), align: "right" },
+      { header: "Sale Return Loose Pcs", width: 105, accessor: (r) => ls(r, r.saleReturned.qty), align: "right" },
       { header: "Sale Return Amt", width: 90, accessor: (r) => r.saleReturned.amount, align: "right", moneyCol: true },
       { header: "Fresh Stock", width: 70, accessor: (r) => r.fresh, align: "right" },
+      { header: "Fresh Case", width: 70, accessor: (r) => cs(r, r.fresh), align: "right" },
+      { header: "Fresh Loose Pcs", width: 85, accessor: (r) => ls(r, r.fresh), align: "right" },
       { header: "Expired Stock", width: 80, accessor: (r) => r.expired, align: "right" },
+      { header: "Expired Case", width: 75, accessor: (r) => cs(r, r.expired), align: "right" },
+      { header: "Expired Loose Pcs", width: 90, accessor: (r) => ls(r, r.expired), align: "right" },
       { header: "Damaged Stock", width: 80, accessor: (r) => r.damaged, align: "right" },
+      { header: "Damaged Case", width: 80, accessor: (r) => cs(r, r.damaged), align: "right" },
+      { header: "Damaged Loose Pcs", width: 95, accessor: (r) => ls(r, r.damaged), align: "right" },
     ];
 
-    await sendExcelFile(res, "Item Report", columns, records, "Item_Report.xlsx");
+    // The PDF collapses each Qty/Case/Loose triple into one readable
+    // "N Case M Pcs (T)" cell — 28 separate columns is fine in a spreadsheet
+    // but illegible on a printed page.
+    const qtyCell = (r, pcs) => {
+      const sp = splitCasePcsTrunc(pcs, r.packing);
+      return `${sp.caseQty}C ${sp.pcs}P`;
+    };
+    const pdfColumns = [
+      { header: "Item Name", width: 100, accessor: (r) => r.itemName },
+      { header: "Sub Group", width: 76, accessor: (r) => r.subGroupName },
+      { header: "Pack", width: 28, accessor: (r) => r.packing, align: "right" },
+      { header: "Purchased", width: 54, accessor: (r) => qtyCell(r, r.purchased.qty), align: "right" , qtyLegend: true },
+      { header: "Purch. Amt", width: 62, accessor: (r) => fmtNum(r.purchased.amount), align: "right" },
+      { header: "Sold", width: 54, accessor: (r) => qtyCell(r, r.sold.qty), align: "right" , qtyLegend: true },
+      { header: "Sold Amt", width: 62, accessor: (r) => fmtNum(r.sold.amount), align: "right" },
+      { header: "Pur. Ret", width: 54, accessor: (r) => qtyCell(r, r.purchaseReturned.qty), align: "right" , qtyLegend: true },
+      { header: "Sale Ret", width: 54, accessor: (r) => qtyCell(r, r.saleReturned.qty), align: "right" , qtyLegend: true },
+      { header: "Fresh", width: 54, accessor: (r) => qtyCell(r, r.fresh), align: "right" , qtyLegend: true },
+      { header: "Expired", width: 54, accessor: (r) => qtyCell(r, r.expired), align: "right" , qtyLegend: true },
+      { header: "Damaged", width: 54, accessor: (r) => qtyCell(r, r.damaged), align: "right" , qtyLegend: true },
+    ];
+
+    await sendReportFile(res, {
+      format: req.query.format,
+      company: await loadCompanyLetterhead(req),
+      title: "Item Report",
+      columns,
+      pdfColumns,
+      records: records,
+      baseFilename: "Item_Report",
+    });
   } catch (error) {
     sendExportError(res, error);
   }
@@ -1831,7 +1848,14 @@ const exportCustomerReport = async (req, res) => {
       { header: "Net Pending", width: 90, accessor: (r) => r.netPendingAmount, align: "right", moneyCol: true },
     ];
 
-    await sendExcelFile(res, "Customer Report", columns, records, "Customer_Report.xlsx");
+    await sendReportFile(res, {
+      format: req.query.format,
+      company: await loadCompanyLetterhead(req),
+      title: "Customer Report",
+      columns,
+      records: records,
+      baseFilename: "Customer_Report",
+    });
   } catch (error) {
     sendExportError(res, error);
   }
@@ -1924,7 +1948,14 @@ const exportSupplierReport = async (req, res) => {
       { header: "Net Pending", width: 90, accessor: (r) => r.netPendingAmount, align: "right", moneyCol: true },
     ];
 
-    await sendExcelFile(res, "Supplier Report", columns, records, "Supplier_Report.xlsx");
+    await sendReportFile(res, {
+      format: req.query.format,
+      company: await loadCompanyLetterhead(req),
+      title: "Supplier Report",
+      columns,
+      records: records,
+      baseFilename: "Supplier_Report",
+    });
   } catch (error) {
     sendExportError(res, error);
   }
@@ -1970,13 +2001,21 @@ const exportPurchaseReport = async (req, res) => {
       { header: "Godown", width: 90, accessor: (r) => gMap.get(String(r.godownId)) || "-" },
       { header: "Case", width: 50, accessor: (r) => r.caseQty, align: "right" },
       { header: "Pcs", width: 50, accessor: (r) => r.pcsQty, align: "right" },
+      { header: "Total Pcs", width: 65, accessor: (r) => r.totalPieces, align: "right" },
       { header: "Rate", width: 70, accessor: (r) => r.rate, align: "right" },
       { header: "Taxable", width: 85, accessor: (r) => r.taxableValue, align: "right", moneyCol: true },
       { header: "GST", width: 75, accessor: (r) => r.gstAmount, align: "right", moneyCol: true },
       { header: "Net Value", width: 90, accessor: (r) => r.netValue, align: "right", moneyCol: true },
     ];
 
-    await sendExcelFile(res, "Purchase Report", columns, data, "Purchase_Report.xlsx");
+    await sendReportFile(res, {
+      format: req.query.format,
+      company: await loadCompanyLetterhead(req),
+      title: "Purchase Report",
+      columns,
+      records: data,
+      baseFilename: "Purchase_Report",
+    });
   } catch (error) {
     sendExportError(res, error);
   }
@@ -2025,13 +2064,21 @@ const exportSaleReport = async (req, res) => {
       { header: "Godown", width: 90, accessor: (r) => gMap.get(String(r.godownId)) || "-" },
       { header: "Case", width: 50, accessor: (r) => r.caseQty, align: "right" },
       { header: "Pcs", width: 50, accessor: (r) => r.pcsQty, align: "right" },
+      { header: "Total Pcs", width: 65, accessor: (r) => r.totalPieces, align: "right" },
       { header: "Rate", width: 70, accessor: (r) => r.rate, align: "right" },
       { header: "Taxable", width: 85, accessor: (r) => r.taxableValue, align: "right", moneyCol: true },
       { header: "GST", width: 75, accessor: (r) => r.gstAmount, align: "right", moneyCol: true },
       { header: "Net Value", width: 90, accessor: (r) => r.netValue, align: "right", moneyCol: true },
     ];
 
-    await sendExcelFile(res, "Sale Report", columns, data, "Sale_Report.xlsx");
+    await sendReportFile(res, {
+      format: req.query.format,
+      company: await loadCompanyLetterhead(req),
+      title: "Sale Report",
+      columns,
+      records: data,
+      baseFilename: "Sale_Report",
+    });
   } catch (error) {
     sendExportError(res, error);
   }
@@ -2082,12 +2129,20 @@ const exportPurchaseReturnReport = async (req, res) => {
       { header: "Condition", width: 70, accessor: (r) => r.condition },
       { header: "Case", width: 50, accessor: (r) => r.caseQty, align: "right" },
       { header: "Pcs", width: 50, accessor: (r) => r.pcsQty, align: "right" },
+      { header: "Total Pcs", width: 65, accessor: (r) => r.totalPieces, align: "right" },
       { header: "Taxable", width: 85, accessor: (r) => r.taxableValue, align: "right", moneyCol: true },
       { header: "GST", width: 75, accessor: (r) => r.gstAmount, align: "right", moneyCol: true },
       { header: "Net Value", width: 90, accessor: (r) => r.netValue, align: "right", moneyCol: true },
     ];
 
-    await sendExcelFile(res, "Purchase Return Report", columns, data, "Purchase_Return_Report.xlsx");
+    await sendReportFile(res, {
+      format: req.query.format,
+      company: await loadCompanyLetterhead(req),
+      title: "Purchase Return Report",
+      columns,
+      records: data,
+      baseFilename: "Purchase_Return_Report",
+    });
   } catch (error) {
     sendExportError(res, error);
   }
@@ -2138,12 +2193,20 @@ const exportSaleReturnReport = async (req, res) => {
       { header: "Condition", width: 70, accessor: (r) => r.condition },
       { header: "Case", width: 50, accessor: (r) => r.caseQty, align: "right" },
       { header: "Pcs", width: 50, accessor: (r) => r.pcsQty, align: "right" },
+      { header: "Total Pcs", width: 65, accessor: (r) => r.totalPieces, align: "right" },
       { header: "Taxable", width: 85, accessor: (r) => r.taxableValue, align: "right", moneyCol: true },
       { header: "GST", width: 75, accessor: (r) => r.gstAmount, align: "right", moneyCol: true },
       { header: "Net Value", width: 90, accessor: (r) => r.netValue, align: "right", moneyCol: true },
     ];
 
-    await sendExcelFile(res, "Sale Return Report", columns, data, "Sale_Return_Report.xlsx");
+    await sendReportFile(res, {
+      format: req.query.format,
+      company: await loadCompanyLetterhead(req),
+      title: "Sale Return Report",
+      columns,
+      records: data,
+      baseFilename: "Sale_Return_Report",
+    });
   } catch (error) {
     sendExportError(res, error);
   }

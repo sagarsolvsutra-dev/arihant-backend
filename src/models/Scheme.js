@@ -9,7 +9,6 @@ const SchemeSchema = new mongoose.Schema(
     },
     itemGroupId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: "ItemGroup",
       default: null,
     },
     customerId: {

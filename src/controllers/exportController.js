@@ -1,4 +1,5 @@
 const PDFDocument = require("pdfkit");
+const { XLSX, PDF, styleHeaderRow, styleTotalRow, styleDataRow } = require("../utils/exportTheme");
 const ExcelJS = require("exceljs");
 const Godown = require("../models/Godown");
 const Item = require("../models/Item");
@@ -87,6 +88,9 @@ async function buildRows(type, companyId, godownId, godownNameMap, itemSubGroupM
         subGroupName: itemSubGroupMap.get(String(line.itemId)) || "-",
         caseQty: line.caseQty || 0,
         pcsQty: line.pcsQty || 0,
+        // Case/Pcs alone leaves the reader to multiply by packing in their
+        // head; every quantity in this app now also prints its piece total.
+        totalPieces: line.totalPieces || 0,
         // condition is now stored directly as one of the 3 real display values
         // (Fresh/Expired/Damaged) — no remapping needed.
         condition: config.hasCondition ? line.condition || "Fresh" : undefined,
@@ -109,6 +113,7 @@ function columnsFor(config, isAllGodowns) {
   cols.push({ key: "subGroupName", header: "Sub Group", width: 90 });
   cols.push({ key: "caseQty", header: "Case", width: 45, align: "right" });
   cols.push({ key: "pcsQty", header: "Pcs", width: 45, align: "right" });
+  cols.push({ key: "totalPieces", header: "Total Pcs", width: 55, align: "right" });
   if (config.hasCondition) cols.push({ key: "condition", header: "Condition", width: 65 });
   cols.push({ key: "rate", header: "Rate", width: 65, align: "right", money: true });
   cols.push({ key: "netValue", header: "Net Value", width: 75, align: "right", money: true });
@@ -119,14 +124,12 @@ function addExcelSheet(workbook, sheetName, columns, rows) {
   const sheet = workbook.addWorksheet(sheetName.slice(0, 31));
   sheet.columns = columns.map((c) => ({ header: c.header, key: c.key, width: Math.max(12, Math.round(c.width / 6)) }));
   rows.forEach((r) => sheet.addRow(r));
-  const headerRow = sheet.getRow(1);
-  headerRow.eachCell((cell) => {
-    cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF111111" } };
-  });
+  styleHeaderRow(sheet.getRow(1));
+  // Zebra-stripe the body so a wide export stays readable across columns.
+  rows.forEach((_, i) => styleDataRow(sheet.getRow(i + 2), i));
   const totalNetValue = rows.reduce((s, r) => s + (r.netValue || 0), 0);
   const totalRow = sheet.addRow({ [columns[0].key]: "TOTAL", [columns[columns.length - 1].key]: totalNetValue });
-  totalRow.font = { bold: true };
+  styleTotalRow(totalRow);
   return totalNetValue;
 }
 
@@ -147,13 +150,13 @@ function drawPdfSection(doc, y, sectionTitle, columns, rows, totalWidth, forceNe
     y = doc.page.margins.top;
   }
 
-  doc.fontSize(13).fillColor("#000").text(sectionTitle, startX, y);
+  doc.fontSize(13).fillColor(PDF.accent).text(sectionTitle, startX, y);
   y = doc.y + 6;
 
   function drawHeaderRow() {
     let x = startX;
-    doc.rect(startX, y, totalWidth, rowHeight).fill("#111111");
-    doc.fillColor("#fff").fontSize(9);
+    doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.headerBg);
+    doc.fillColor(PDF.headerText).fontSize(9);
     columns.forEach((c) => {
       doc.text(c.header, x + 4, y + 6, { width: c.width - 8, align: c.align || "left" });
       x += c.width;
@@ -164,7 +167,7 @@ function drawPdfSection(doc, y, sectionTitle, columns, rows, totalWidth, forceNe
   drawHeaderRow();
 
   if (rows.length === 0) {
-    doc.fillColor("#888").fontSize(8.5).text("No records.", startX + 4, y + 4);
+    doc.fillColor(PDF.mutedText).fontSize(8.5).text("No records.", startX + 4, y + 4);
     y += rowHeight;
   }
 
@@ -175,10 +178,10 @@ function drawPdfSection(doc, y, sectionTitle, columns, rows, totalWidth, forceNe
       drawHeaderRow();
     }
     if (idx % 2 === 1) {
-      doc.rect(startX, y, totalWidth, rowHeight).fill("#f5f5f5");
+      doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.zebraBg);
     }
     let x = startX;
-    doc.fillColor("#000").fontSize(8.5);
+    doc.fillColor(PDF.bodyText).fontSize(8.5);
     columns.forEach((c) => {
       let val = r[c.key];
       if (c.money) val = `Rs.${(val || 0).toFixed(2)}`;
@@ -192,8 +195,8 @@ function drawPdfSection(doc, y, sectionTitle, columns, rows, totalWidth, forceNe
     doc.addPage();
     y = doc.page.margins.top;
   }
-  doc.rect(startX, y, totalWidth, rowHeight).fill("#e5e5e5");
-  doc.fillColor("#000").fontSize(9);
+  doc.rect(startX, y, totalWidth, rowHeight).fill(PDF.totalBg);
+  doc.fillColor(PDF.totalText).fontSize(9);
   doc.text("TOTAL", startX + 4, y + 6, { width: columns[0].width - 8 });
   const lastCol = columns[columns.length - 1];
   const lastColX = startX + totalWidth - lastCol.width;
@@ -275,8 +278,8 @@ const exportGodownTransactions = async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${safeName}.pdf"`);
     doc.pipe(res);
 
-    doc.fontSize(16).fillColor("#000").text(`${godownName} - ${reportLabel}`);
-    doc.fontSize(9).fillColor("#666").text(`Generated ${new Date().toLocaleString("en-IN")}`);
+    doc.fontSize(16).fillColor(PDF.accent).text(`${godownName} - ${reportLabel}`);
+    doc.fontSize(9).fillColor(PDF.mutedText).text(`Generated ${new Date().toLocaleString("en-IN")}`);
     let y = doc.y + 16;
 
     sections.forEach(({ config, rows, columns }, idx) => {

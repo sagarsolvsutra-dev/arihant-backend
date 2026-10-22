@@ -9,11 +9,15 @@ const {
   createPurchaseReturn,
   updatePurchaseReturn,
   deletePurchaseReturn,
+  getPurchaseReturnInvoice,
 } = require("../controllers/purchaseReturnController");
 
 // Static path registered before the /:id param route so "lookup-invoice" isn't
 // swallowed as an :id value.
 router.get("/lookup-invoice", lookupOriginalInvoice);
+// Printable GST tax-invoice PDF for a single record.
+router.get("/:id/invoice", getPurchaseReturnInvoice);
+
 router.route("/").get(getPurchaseReturns).post(createPurchaseReturn);
 router.route("/:id").get(getPurchaseReturnById).put(updatePurchaseReturn).delete(deletePurchaseReturn);
 
