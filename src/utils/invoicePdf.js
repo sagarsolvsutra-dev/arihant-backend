@@ -181,21 +181,27 @@ function resolveAddressBlocks(party, partyGstLabel) {
 }
 
 // ---------------------------------------------------------------------------
-// Page sizes.
+// Page size: **A4 portrait** (595.28 x 841.89pt = 210 x 297mm), FIXED.
 //
-// The reference invoice this layout reproduces is **A5 landscape**
-// (595.28 x 419.53pt = 210 x 148mm) — the usual Indian invoice stationery,
-// and exactly what came back from measuring the supplied PDF's MediaBox. Note
-// its width is identical to A4 PORTRAIT; only the height is halved. The
-// renderer starts there and grows the page only when the real content will
-// not fit (see fitLayout below), so a normal invoice prints on the stationery
-// the business already uses.
+// A4 is a physical sheet, so the page does not grow to fit the data — growing
+// it past A4 would defeat the point of asking for A4 in the first place. The
+// invoice adapts to more data in two other ways instead:
+//
+//   1. fitLayout picks the largest font at which the real columns still fit
+//      the A4 width, shrinking only as far as it has to.
+//   2. drawInvoice paginates when the rows run past the reserved footer band,
+//      repeating the table header on each new sheet.
+//
+// (The reference invoice from the previous software was A5 landscape — the
+// same 595.28 width, half the height. Switching to A4 keeps every column
+// position identical and simply gives the item table far more room per sheet.)
+//
+// maxWidth is a last-resort valve only: see fitLayout.
 // ---------------------------------------------------------------------------
 const PAGE = {
-  width: 595.28,          // A5 landscape width (== A4 portrait width)
-  minHeight: 419.53,      // A5 landscape height
-  maxHeight: 1190.0,      // A3 portrait height — hard ceiling before paginating
-  maxWidth: 1190.0,       // A3 landscape width — hard ceiling for very wide tables
+  width: 595.28,          // A4 portrait width
+  height: 841.89,         // A4 portrait height — fixed; overflow paginates
+  maxWidth: 1190.0,       // A3 landscape — only if even the smallest font fails
   margin: 24,
 };
 
@@ -204,16 +210,12 @@ const PAGE = {
 // and a dense one shrinks instead of colliding or being truncated.
 const FONT = {
   rowMax: 9.5,      // ceiling for the line-table body
-  // Comfort floor. fitLayout will WIDEN THE PAGE before shrinking the table
-  // text below this, because unreadable-but-on-A5 is the wrong trade. Only if
-  // the page also hits PAGE.maxWidth does it shrink further, down to hardMin.
-  // 7pt is the measured threshold at which a realistic 6-product invoice
-  // (full product names, 5-digit amounts) still fits A5-landscape width —
-  // which is exactly why the reference invoice uses 7pt. Holding the floor
-  // here keeps normal invoices on the business's existing stationery; above
-  // it fitLayout still uses the largest size that fits, so a short invoice
-  // prints at up to rowMax.
-  rowComfort: 7,
+  // Smallest size the table may use. Below this the figures stop being
+  // readable in print, so fitLayout widens the sheet instead (see there).
+  // For reference, the supplied invoice set its own table at 7pt, and a
+  // realistic 6-product invoice with full product names and 5-digit amounts
+  // measures out at about that — so hardMin is a guard against pathological
+  // data, not a size normal invoices ever reach.
   hardMin: 5.6,
   step: 0.25,
 };
@@ -332,24 +334,26 @@ function fitLayout(probe, m) {
     return { widths, total: widths.reduce((a, b) => a + b, 0) };
   }
 
-  // Largest font that fits the base page width, but never shrink below the
-  // comfort floor just to stay on A5 — widen the page for that instead.
+  // Largest font at which the real columns fit the A4 width.
+  //
+  // The page is A4, so staying on A4 outranks font size here: shrink all the
+  // way to hardMin before even considering a wider sheet. In practice
+  // realistic invoices settle well above hardMin — a 6-product invoice with
+  // full names and 5-digit amounts lands around 7pt, the same size the
+  // reference invoice used.
   let size = FONT.rowMax;
   let best = measure(size);
-  while (best.total > avail0 && size - FONT.step >= FONT.rowComfort) {
+  while (best.total > avail0 && size - FONT.step >= FONT.hardMin) {
     size = +(size - FONT.step).toFixed(2);
     best = measure(size);
   }
 
   let pageWidth = PAGE.width;
   if (best.total > avail0) {
-    // Doesn't fit at the comfort floor. Prefer a wider page over smaller text.
+    // Even the smallest readable font cannot fit these columns on A4. Widening
+    // is the lesser evil: a sheet that needs trimming still carries every real
+    // figure, whereas truncating a tax document does not.
     pageWidth = Math.min(PAGE.maxWidth, best.total + PAGE.margin * 2);
-    // Only if the page is already as wide as it may go do we shrink further.
-    while (best.total > pageWidth - PAGE.margin * 2 && size - FONT.step >= FONT.hardMin) {
-      size = +(size - FONT.step).toFixed(2);
-      best = measure(size);
-    }
   }
 
   const avail = pageWidth - PAGE.margin * 2;
@@ -637,24 +641,14 @@ function drawInvoice(doc, m, layout) {
 async function sendInvoicePdf(res, { doc: tx, company, party, bank, titles, filename, gstInclusive = false }) {
   const model = buildInvoiceModel({ doc: tx, company, party, bank, titles, gstInclusive });
 
-  const probe = new PDFDocument({ size: [PAGE.width, PAGE.minHeight], margin: PAGE.margin });
+  const probe = new PDFDocument({ size: [PAGE.width, PAGE.height], margin: PAGE.margin });
   const layout = fitLayout(probe, model);
 
-  // Grow the page height so a modest invoice still prints on one sheet;
-  // beyond maxHeight drawInvoice paginates instead.
-  // Taller now the letterhead is 16pt, and taller again when the party has a
-  // separate Ship To address (two stacked blocks instead of one).
-  const twoAddresses = resolveAddressBlocks(model.party, model.titles?.partyGstLabel).length > 1;
-  const headerH = twoAddresses ? 196 : 128;
-  const footerH = 172 + layout.size * 2;
-  const rowsH = model.lines.length * (layout.size + 3.5) + 40;
-  const pageHeight = Math.max(
-    PAGE.minHeight,
-    Math.min(PAGE.maxHeight, headerH + rowsH + footerH + PAGE.margin * 2)
-  );
-
+  // Height is always A4 — a one-line invoice prints on a full sheet with the
+  // footer pinned to the bottom, exactly as a real invoice does, and anything
+  // longer paginates (drawInvoice repeats the table header per sheet).
   const pdf = new PDFDocument({
-    size: [layout.pageWidth, pageHeight],
+    size: [layout.pageWidth, PAGE.height],
     margin: PAGE.margin,
     layout: "portrait",
   });
